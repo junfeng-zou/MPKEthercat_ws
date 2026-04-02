@@ -1,3 +1,0 @@
-[submodule "src/ethercat_driver_ros2"]
-	path = src/ethercat_driver_ros2
-	url = https://github.com/ICube-Robotics/ethercat_driver_ros2.git
