@@ -11,4 +11,3 @@ __pycache__/
 
 # Workspace artifacts
 src/MPKEthercat_test.zip
-src/ethercat_driver_ros2/
