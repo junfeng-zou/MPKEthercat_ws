@@ -1,0 +1,13 @@
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local IDE files
+.vscode/
+
+# Workspace artifacts
+src/MPKEthercat_test.zip
