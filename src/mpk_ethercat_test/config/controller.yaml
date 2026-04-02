@@ -1,0 +1,55 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000 
+
+    # joint_state_broadcaster:
+    #   type: joint_state_broadcaster/JointStateBroadcaster
+    #   publish_rate: 50.0
+
+    MotorDataBroadcaster:
+      type: mpk_ethercat_test/MotorDataBroadcaster
+
+    control_word_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    op_mode_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    velocity_controller:
+      type: forward_command_controller/ForwardCommandController
+
+MotorDataBroadcaster:
+  ros__parameters:
+    # 物理量换算（关节1: 丝杠导程10mm/圈，17位编码器）
+    # 距离定义：编码器计数减小方向为距离正方向
+    # distance_mm = (position_bias_count - actual_position_count) * screw_lead_mm_per_rev / encoder_counts_per_rev
+    position_bias_count: 3373839
+    encoder_counts_per_rev: 131072
+    screw_lead_mm_per_rev: 10.0
+
+control_word_controller:
+  ros__parameters:
+    joints:
+      - motor_joint_1
+    interface_name: control_word
+
+op_mode_controller:
+  ros__parameters:
+    joints:
+      - motor_joint_1
+    interface_name: op_mode
+
+position_controller:
+  ros__parameters:
+    joints:
+      - motor_joint_1
+    interface_name: position
+
+velocity_controller:
+  ros__parameters:
+    joints:
+      - motor_joint_1
+    interface_name: velocity
