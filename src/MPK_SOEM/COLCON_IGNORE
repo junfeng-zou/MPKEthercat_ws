@@ -1,0 +1,6 @@
+Standalone CMake route.
+
+This directory is intentionally not a colcon/ROS package. Build it with:
+
+  cmake -S src/MPK_SOEM -B src/MPK_SOEM/build
+  cmake --build src/MPK_SOEM/build -j

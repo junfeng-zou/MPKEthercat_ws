@@ -1,0 +1,154 @@
+# ============================================================
+# controllers.yaml
+# ------------------------------------------------------------
+#   Controller manager configuration for the Denali XCR
+#   multi-motor system (4 .. 8 joints by default).
+#
+#   Layout:
+#     always-active controllers (loaded+started by launch):
+#       - joint_state_broadcaster
+#       - cia402_cmd_controller     -> writes 0x6040 Control Word
+#       - cia402_mode_controller    -> writes 0x6060 Modes of operation
+#       - fault_reset_controller    -> toggles "reset_fault" interface
+#
+#     mutually-exclusive motion controllers (loaded INACTIVE,
+#     GUI activates exactly one at a time):
+#       - pp_controller
+#       - csp_controller
+#       - csv_controller
+#       - pv_controller
+#
+#   Expansion to 8 joints: just append joint_5 .. joint_8 to
+#   every `joints:` list below.
+# ============================================================
+
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # Hz, matches EtherCAT DC cycle (1 ms)
+    # cpu_affinity: [3]           # 固定到 CPU 3
+    # thread_priority: 80         # update 线程 SCHED_FIFO 80
+    # lock_memory: true           # mlockall
+
+    # ----- always-on -----
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    cia402_cmd_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    cia402_mode_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    fault_reset_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    # ----- motion controllers (start INACTIVE) -----
+    pp_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    csp_controller:
+      type: position_controllers/JointGroupPositionController
+
+    csv_controller:
+      type: velocity_controllers/JointGroupVelocityController
+
+    pv_controller:
+      type: forward_command_controller/ForwardCommandController
+
+
+# ------------------------------------------------------------
+# Individual controller parameters
+# ------------------------------------------------------------
+
+joint_state_broadcaster:
+  ros__parameters:
+    # Publish ALL standard + custom interfaces on /dynamic_joint_states
+    # by default (no `joints` / `interfaces` filter). The GUI reads
+    # status_word / modes_of_operation_display from there.
+    #
+    # NOTE: do NOT put `extra_joints: []` here - an empty YAML list
+    # cannot be typed by rclcpp and will crash the node. Leave the
+    # parameter unset so the controller uses its hard-coded default.
+    use_local_topics: false
+
+# CiA 402 Control Word writer -- Float64 is cast to uint16 by the
+# hardware interface. Topic: /cia402_cmd_controller/commands
+cia402_cmd_controller:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+    interface_name: control_word
+
+# Modes of Operation writer (object 0x6060). Values:
+#   1 = PP, 3 = PV, 8 = CSP, 9 = CSV, 6 = Homing
+# Topic: /cia402_mode_controller/commands
+cia402_mode_controller:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+    interface_name: modes_of_operation
+
+# Fault-reset auxiliary pulser. With auto_state_transitions=false,
+# the GUI also writes 0x0080 directly through cia402_cmd_controller;
+# keep this interface available for plugin-compatible reset workflows.
+# Topic: /fault_reset_controller/commands
+fault_reset_controller:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+    interface_name: reset_fault
+
+# --- motion controllers -------------------------------------------------
+
+# PP - Profile Position. Topic: /pp_controller/commands
+# Writes 0x607A Target Position in mode 1; the GUI then pulses
+# Control Word bit 4 (new set-point).
+pp_controller:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+    interface_name: position
+
+# CSP - Cyclic Sync Position. Topic: /csp_controller/commands
+csp_controller:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+
+# CSV - Cyclic Sync Velocity. Topic: /csv_controller/commands
+csv_controller:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+
+# PV - Profile Velocity.  CiA 402 uses 0x60FF Target Velocity in
+# Profile Velocity mode too. This intentionally shares the same
+# `velocity` command_interface as CSV; the GUI keeps csv_controller
+# and pv_controller mutually exclusive.
+# Topic: /pv_controller/commands
+pv_controller:
+  ros__parameters:
+    joints:
+      - joint_1
+      - joint_2
+      - joint_3
+      - joint_4
+    interface_name: velocity

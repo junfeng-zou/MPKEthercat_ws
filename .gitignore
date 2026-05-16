@@ -1,13 +1,48 @@
-build/
-install/
-log/
+# colcon / ROS 2 build outputs
+/build/
+/install/
+/log/
+/legacy/
+/src/MPK_SOEM/build/
 
-# Python cache
+# Python caches
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Local IDE files
-.vscode/
+# C/C++ build byproducts
+*.o
+*.a
+!/src/MPK_SOEM/third_party/SOEM/oshw/win32/wpcap/Lib/libpacket.a
+!/src/MPK_SOEM/third_party/SOEM/oshw/win32/wpcap/Lib/libwpcap.a
+*.so
+*.dylib
+*.dll
+compile_commands.json
 
-# Workspace artifacts
-src/MPKEthercat_test.zip
+# Local ROS/runtime files
+/.ros/
+*.bag
+*.db3
+*.mcap
+
+# Editor and local tooling state
+/.vscode/
+/.idea/
+/.codex/
+/.agents/
+/.git.broken_backup/
+/src/ethercat_driver_ros2/.git.upstream_backup/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Local-only assistant notes
+/CLAUDE.md

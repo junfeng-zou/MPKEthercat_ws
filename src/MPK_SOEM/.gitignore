@@ -1,0 +1,14 @@
+# Local CMake build output for this standalone route
+/build/
+
+# Runtime/editor noise
+*.o
+*.a
+!third_party/SOEM/oshw/win32/wpcap/Lib/libpacket.a
+!third_party/SOEM/oshw/win32/wpcap/Lib/libwpcap.a
+*.so
+*.dylib
+*.dll
+compile_commands.json
+__pycache__/
+*.py[cod]

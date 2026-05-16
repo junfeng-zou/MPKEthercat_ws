@@ -30,7 +30,6 @@
 #include "ethercat_driver/visibility_control.h"
 #include "ethercat_interface/ec_slave.hpp"
 #include "ethercat_interface/ec_master.hpp"
-#include "yaml-cpp/yaml.h"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
@@ -43,8 +42,7 @@ public:
   RCLCPP_SHARED_PTR_DEFINITIONS(EthercatDriver)
 
   ETHERCAT_DRIVER_PUBLIC
-  CallbackReturn on_init(
-    const hardware_interface::HardwareInfo & hardware_info) override;
+  CallbackReturn on_init(const hardware_interface::HardwareInfo & info) override;
 
   ETHERCAT_DRIVER_PUBLIC
   CallbackReturn on_configure(const rclcpp_lifecycle::State & previous_state) override;
@@ -67,47 +65,10 @@ public:
   ETHERCAT_DRIVER_PUBLIC
   hardware_interface::return_type write(const rclcpp::Time &, const rclcpp::Duration &) override;
 
-protected:
+private:
   std::vector<std::unordered_map<std::string, std::string>> getEcModuleParam(
-    const std::string & urdf,
-    const std::string & component_name,
-    const std::string & component_type);
+    std::string & urdf, std::string component_name, std::string component_type);
 
-  uint16_t getAliasOrDefaultAlias(
-    const std::unordered_map<std::string,
-    std::string> & slave_parameters);
-
-  virtual CallbackReturn setupMaster();
-
-  CallbackReturn configNetwork();
-
-  /** @brief Load transfer config YAML file
-   * One use case is to load transfers for FailSafe Over EtherCAT Safety
-   * @param[out] node YAML node containing the transfer configuration root
-   * @param[in] path Path to the YAML file, if empty, the file is loaded from the *fsoe_config*
-   * or *transfer_config* of the YAML document
-   */
-  void loadTransferConfigYamlFile(YAML::Node & node, const std::string & path = "");
-
-  /** @brief Get transfer module parameters from YAML file
-   * @param[in] config YAML node containing the transfer configuration root
-   * @return Vector of maps containing transfer module parameters, each map corresponds to a module
-   * involved in a transfer
-   */
-  std::vector<std::unordered_map<std::string, std::string>> getEcTransferModuleParam(
-    const YAML::Node & config);
-
-  /** @brief Get transfer nets from YAML file
-   * @param[in] config YAML node containing the transfer configuration root
-   * @return Vector of transfer nets
-   */
-  std::vector<ethercat_interface::EcTransferNet> getEcTransferNets(const YAML::Node & config);
-
-  /** @brief Configure the transfer networks
-   */
-  void configTransferNetwork();
-
-protected:
   std::vector<std::shared_ptr<ethercat_interface::EcSlave>> ec_modules_;
   std::vector<std::unordered_map<std::string, std::string>> ec_module_parameters_;
 
@@ -121,22 +82,10 @@ protected:
   pluginlib::ClassLoader<ethercat_interface::EcSlave> ec_loader_{
     "ethercat_interface", "ethercat_interface::EcSlave"};
 
-  double control_frequency_;
-
-  std::shared_ptr<ethercat_interface::EcMaster> master_;
+  int control_frequency_;
+  ethercat_interface::EcMaster master_;
   std::mutex ec_mutex_;
   bool activated_;
-
-  /** Transfer nets */
-  std::vector<ethercat_interface::EcTransferNet> ec_transfer_nets_;
-
-  /** Indexes of modules inside ec_modules_ vector that are transfer masters */
-  std::vector<size_t> ec_transfer_masters_;
-  /** Indexes of modules inside ec_modules_ vector that are transfer slaves only */
-  std::vector<size_t> ec_transfer_slaves_;
-
-  /** Empty interfaces */
-  std::vector<double> empty_interface_;
 };
 }  // namespace ethercat_driver
 

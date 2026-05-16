@@ -18,7 +18,6 @@
 #define ETHERCAT_INTERFACE__EC_SYNC_MANAGER_HPP_
 
 #include <ecrt.h>
-#include <iostream>
 #include <string>
 #include <vector>
 #include <limits>
@@ -59,25 +58,10 @@ public:
     }
     // pdo name
     if (sm_config["pdo"]) {
-      const auto pdo = sm_config["pdo"];
-      // Standard config expects a scalar: rpdo/tpdo/~. Some user configs embed
-      // full PDO mapping sequences/maps under this key. Be permissive here:
-      // - scalar: parse as before
-      // - null: keep "null"
-      // - sequence/map: infer from SM direction (output->rpdo, input->tpdo)
-      if (pdo.IsScalar()) {
-        const auto pdo_str = pdo.as<std::string>();
-        if (pdo_str == "rpdo") {
-          pdo_name = "rpdo";
-        } else if (pdo_str == "tpdo") {
-          pdo_name = "tpdo";
-        } else {
-          pdo_name = "null";
-        }
-      } else if (pdo.IsNull()) {
-        pdo_name = "null";
-      } else if (pdo.IsSequence() || pdo.IsMap()) {
-        pdo_name = (type == EC_DIR_OUTPUT) ? "rpdo" : "tpdo";
+      if (sm_config["pdo"].as<std::string>() == "rpdo") {
+        pdo_name = "rpdo";
+      } else if (sm_config["pdo"].as<std::string>() == "tpdo") {
+        pdo_name = "tpdo";
       }
     }
     // watchdog

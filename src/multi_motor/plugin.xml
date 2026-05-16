@@ -1,0 +1,23 @@
+<!--
+  plugin.xml : rqt plugin manifest.
+  Registered in package.xml via <export><rqt_gui plugin=.../></export>
+-->
+<library path="multi_motor_control">
+  <class type="multi_motor_control.my_motor_rqt_plugin.MotorRQTPlugin"
+         base_class_type="rqt_gui_py::Plugin">
+    <description>
+      Denali XCR multi-axis CiA 402 control panel.
+      Status monitoring, enable / disable / fault-reset, mode
+      switching (PP / CSP / CSV / PV) with controller_manager life-cycle,
+      position streaming and velocity one-shot commands.
+    </description>
+    <qtgui>
+      <group>
+        <label>Robot</label>
+      </group>
+      <label>Multi Motor Control</label>
+      <icon type="theme">applications-system</icon>
+      <statustip>CiA 402 multi-motor control plugin.</statustip>
+    </qtgui>
+  </class>
+</library>

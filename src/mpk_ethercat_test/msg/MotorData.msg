@@ -1,8 +1,0 @@
-std_msgs/Header header
-
-uint16 status_word
-int32 actual_position
-int32 actual_velocity
-int8 operation_mode
-float64 actual_physical_position
-float64 actual_physical_velocity

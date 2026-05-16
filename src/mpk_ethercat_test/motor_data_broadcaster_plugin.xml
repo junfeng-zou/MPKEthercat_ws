@@ -1,9 +1,0 @@
-<library path="motor_data_broadcaster">
-  <class name="mpk_ethercat_test/MotorDataBroadcaster"
-         type="MPKEthercat_test::MotorDataBroadcaster"
-         base_class_type="controller_interface::ControllerInterface">
-    <description>
-      Publishes motor state (status_word, position, velocity, operation_mode) from EtherCAT state interfaces to MotorData topic.
-    </description>
-  </class>
-</library>

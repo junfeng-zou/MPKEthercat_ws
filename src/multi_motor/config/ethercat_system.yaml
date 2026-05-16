@@ -1,0 +1,112 @@
+# ============================================================
+# Novanta Denali XCR - EtherCAT Slave Configuration
+# ------------------------------------------------------------
+#   Consumed by ICube-Robotics/ethercat_driver_ros2
+#   Plugin: ethercat_generic_plugins/EcCiA402Drive
+#
+#   NOTE
+#   - This file describes ONE slave. Because all 3~8 motors are
+#     the same Denali XCR, they all share this file. Each motor
+#     gets its own <ec_module> in the xacro with a different
+#     `alias` / `position`.
+#   - Field names follow the upstream docs strictly:
+#       https://icube-robotics.github.io/ethercat_driver_ros2/
+#         user_guide/config_generic_slave.html
+#         user_guide/config_cia402_drive.html
+# ============================================================
+
+vendor_id: 0x0000029c
+product_id: 0x03831002
+# If DC sync is required for CSP/CSV, activate SYNC0 (0x0300).
+# Change to 0x00 if the drive is only operated in PV (non-cyclic).
+assign_activate: 0x0300
+
+# Drive behaviour on fault:
+#   false -> fault reset only on rising edge command on
+#            "reset_fault" command_interface (driven from GUI).
+auto_fault_reset: false
+
+# Disable automatic CiA 402 state machine progression.
+# With auto_state_transitions: true (the plugin default), the drive plugin
+# automatically walks ALL slaves toward Operation Enabled at start-up.
+# When 4 drives are daisy-chained, one may fail this automatic transition
+# and enter a Fault→Reset→Fault loop before the GUI can intervene.
+# Setting false keeps drives in Switch On Disabled until the GUI explicitly
+# enables them via the cia402_cmd_controller.
+auto_state_transitions: false
+
+# ------------------------------------------------------------
+# SDO : written ONCE at slave activation (startup)
+# ------------------------------------------------------------
+#   If you see "Failed to execute SDO download: Invalid argument"
+#   at start-up, it's almost always ONE of:
+#     - drives are not powered / not on the bus
+#     - object type mismatch (check your Denali XCR ESI / manual)
+#     - object is read-only or write-disabled in the current state
+#   Start with the MINIMAL set below, then add more once bring-up
+#   is stable.
+# ------------------------------------------------------------
+sdo:
+  # Interpolation time for cyclic modes: 1e-3 s = 1 ms
+  - {index: 0x60c2, sub_index: 1, type: int8,  value: 1}
+  - {index: 0x60c2, sub_index: 2, type: int8,  value: -3}
+
+  # Keep startup SDOs minimal while checking EtherCAT state/status.
+  # Re-add profile parameters only after /dynamic_joint_states reports
+  # non-zero 0x6041 Status Word values from all drives.
+  #
+  # Optional profile parameters:
+  # - {index: 0x6081, sub_index: 0, type: uint32, value: 500000}   # Profile velocity for PP
+  # - {index: 0x6083, sub_index: 0, type: uint32, value: 500000}   # Profile accel
+  # - {index: 0x6084, sub_index: 0, type: uint32, value: 500000}   # Profile decel
+  # - {index: 0x6085, sub_index: 0, type: uint32, value: 1000000}  # Quick-stop decel
+  # - {index: 0x606d, sub_index: 0, type: uint16, value: 10}       # Velocity window
+  # - {index: 0x606e, sub_index: 0, type: uint16, value: 100}      # Velocity window time
+  # - {index: 0x6067, sub_index: 0, type: uint32, value: 100}      # Position window
+  # - {index: 0x6068, sub_index: 0, type: uint16, value: 100}      # Position window time
+
+# ------------------------------------------------------------
+# RxPDO : master -> slave
+# ------------------------------------------------------------
+#   ALL command interfaces are declared here. Because the PDO
+#   default is sent whenever the command_interface value is NaN,
+#   we set Control Word default=0 so the drive stays DISABLED
+#   between power-on and the moment the GUI takes over.
+# ------------------------------------------------------------
+rpdo:
+  - index: 0x1600
+    channels:
+      - {index: 0x6040, sub_index: 0, type: uint16,
+         command_interface: control_word, default: 0}
+      - {index: 0x607a, sub_index: 0, type: int32,
+         command_interface: position,    default: .nan}
+      # CiA 402 uses 0x60FF Target Velocity for both CSV and PV.
+      # The controllers are mutually exclusive, so one command_interface is enough.
+      - {index: 0x60ff, sub_index: 0, type: int32,
+         command_interface: velocity,    default: 0}
+      - {index: 0x6060, sub_index: 0, type: int8,
+         command_interface: modes_of_operation, default: 0}
+
+# ------------------------------------------------------------
+# TxPDO : slave -> master
+# ------------------------------------------------------------
+tpdo:
+  - index: 0x1a00
+    channels:
+      - {index: 0x6041, sub_index: 0, type: uint16,
+         state_interface: status_word}
+      - {index: 0x6064, sub_index: 0, type: int32,
+         state_interface: position}
+      - {index: 0x606c, sub_index: 0, type: int32,
+         state_interface: velocity}
+      - {index: 0x6061, sub_index: 0, type: int8,
+         state_interface: modes_of_operation_display}
+
+# ------------------------------------------------------------
+# Sync Manager (default layout - kept explicit for clarity)
+# ------------------------------------------------------------
+sm:
+  - {index: 0, type: output, pdo: ~,    watchdog: disable}
+  - {index: 1, type: input,  pdo: ~,    watchdog: disable}
+  - {index: 2, type: output, pdo: rpdo, watchdog: enable}
+  - {index: 3, type: input,  pdo: tpdo, watchdog: disable}

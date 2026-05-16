@@ -34,17 +34,9 @@ public:
   EcSlave(uint32_t vendor_id, uint32_t product_id)
   : vendor_id_(vendor_id),
     product_id_(product_id) {}
-  EcSlave(uint32_t vendor_id, uint32_t product_id, uint16_t alias, uint16_t position)
-  : vendor_id_(vendor_id),
-    product_id_(product_id)
-  {
-    setAliasAndPosition(alias, position);
-  }
   virtual ~EcSlave() {}
-
-public:
-  /** read or write data to the domain from the index of the entry in the recorded pdos */
-  virtual void processData(size_t /*entry_idx*/, uint8_t * /*domain_address*/) {}
+  /** read or write data to the domain */
+  virtual void processData(size_t /*index*/, uint8_t * /*domain_address*/) {}
   /** a pointer to syncs. return &syncs[0] */
   virtual const ec_sync_info_t * syncs() {return NULL;}
   virtual bool initialized() {return true;}
@@ -60,45 +52,25 @@ public:
   typedef std::map<unsigned int, std::vector<unsigned int>> DomainMap;
   virtual void domains(DomainMap & /*domains*/) const {}
   virtual bool setupSlave(
-    std::unordered_map<std::string, std::string> slave_parameters,
+    std::unordered_map<std::string, std::string> slave_paramters,
     std::vector<double> * state_interface,
     std::vector<double> * command_interface)
   {
     state_interface_ptr_ = state_interface;
     command_interface_ptr_ = command_interface;
-    parameters_ = slave_parameters;
+    paramters_ = slave_paramters;
     return true;
   }
-
-public:
-  inline
-  void setAliasAndPosition(uint16_t alias, uint16_t position)
-  {
-    alias_ = alias;
-    position_ = position;
-    is_alias_and_position_set_ = true;
-  }
-
-  inline
-  bool isAliasAndPositionSet()
-  {
-    return is_alias_and_position_set_;
-  }
-
-public:
-  uint16_t alias_;        //< Slave alias.
-  uint16_t position_;     //< Index after alias. If alias is zero, stores the ring position.
-  uint32_t vendor_id_;   //< Slave vendor ID.
-  uint32_t product_id_;  //< Slave product code.
+  uint32_t vendor_id_;
+  uint32_t product_id_;
 
   std::vector<SdoConfigEntry> sdo_config;
 
 protected:
   std::vector<double> * state_interface_ptr_;
   std::vector<double> * command_interface_ptr_;
-  std::unordered_map<std::string, std::string> parameters_;
+  std::unordered_map<std::string, std::string> paramters_;
   bool is_operational_ = false;
-  bool is_alias_and_position_set_ = false;
 };
 }  // namespace ethercat_interface
 #endif  // ETHERCAT_INTERFACE__EC_SLAVE_HPP_

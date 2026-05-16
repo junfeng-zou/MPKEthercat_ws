@@ -1,0 +1,71 @@
+<?xml version="1.0"?>
+<!--
+  multi_motor.urdf.xacro
+  ============================================================
+  Top-level URDF consumed by robot_state_publisher and
+  controller_manager. Includes ros2_control.xacro to assemble
+  the EtherCAT hardware interface.
+
+  Arguments (change on the launch command line):
+    num_joints     : number of Denali XCR drives on the bus (default 4)
+    slave_config   : absolute path to ethercat_system.yaml
+    master_id      : IgH master index (default 0)
+-->
+<robot name="multi_motor_system" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="num_joints"   default="4"/>
+  <xacro:arg name="slave_config" default=""/>
+  <xacro:arg name="master_id"    default="0"/>
+
+  <!-- Include the ros2_control macro definitions -->
+  <xacro:include filename="$(find multi_motor_control)/urdf/robot.ros2_control.xacro"/>
+
+  <!-- ============================================================
+       Minimal visual skeleton - a stack of cylinders so the URDF
+       can be parsed by robot_state_publisher. Replace with your
+       own mechanical model when available.
+       ============================================================ -->
+  <link name="base_link">
+    <visual>
+      <geometry><box size="0.1 0.1 0.02"/></geometry>
+    </visual>
+  </link>
+
+  <xacro:macro name="dummy_joint_link" params="index">
+    <link name="joint_${index}_link">
+      <visual>
+        <geometry><cylinder length="0.08" radius="0.03"/></geometry>
+      </visual>
+      <inertial>
+        <mass value="0.5"/>
+        <inertia ixx="1e-3" ixy="0" ixz="0" iyy="1e-3" iyz="0" izz="1e-3"/>
+      </inertial>
+    </link>
+    <joint name="joint_${index}" type="revolute">
+      <parent link="base_link"/>
+      <child  link="joint_${index}_link"/>
+      <origin xyz="${0.1*index} 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="-6.283" upper="6.283" effort="100" velocity="50"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="_dummy_list" params="i num">
+    <xacro:if value="${i &lt;= num}">
+      <xacro:dummy_joint_link index="${i}"/>
+      <xacro:_dummy_list i="${i+1}" num="${num}"/>
+    </xacro:if>
+  </xacro:macro>
+  <xacro:_dummy_list i="1" num="$(arg num_joints)"/>
+
+  <!-- ============================================================
+       Instantiate ros2_control
+       ============================================================ -->
+  <xacro:multi_motor_ros2_control
+      name="denali_xcr_cluster"
+      num_joints="$(arg num_joints)"
+      slave_config="$(arg slave_config)"
+      master_id="$(arg master_id)"
+      control_frequency="1000"/>
+
+</robot>
