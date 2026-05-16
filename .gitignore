@@ -3,6 +3,7 @@
 /install/
 /log/
 /legacy/
+/docs/
 /src/MPK_SOEM/build/
 
 # Python caches

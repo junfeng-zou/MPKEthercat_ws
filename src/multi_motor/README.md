@@ -176,9 +176,3 @@ and is 100 % unit-testable without ROS.
 No changes are needed to the slave YAML, xacro, or plugin code itself -
 xacro recursion generates `joint_1..joint_N` from the single `num_joints`
 argument.
-
----
-
-## License
-
-Apache-2.0 - see package.xml.

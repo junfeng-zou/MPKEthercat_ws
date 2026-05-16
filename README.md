@@ -173,7 +173,7 @@ src/MPK_SOEM/README_CN.md
 
 Tracked source should include:
 
-- `README.md`, `log.md`, and `docs/`
+- `README.md` and source/config files
 - `src/multi_motor/`
 - `src/ethercat_driver_ros2/`
 - `src/MPK_SOEM/`
@@ -184,6 +184,7 @@ Ignored local/generated data:
 - `build/`
 - `install/`
 - `log/`
+- `docs/`
 - `legacy/`
 - editor and assistant state: `.vscode/`, `.codex/`, `.agents/`
 - Python caches and compiled artifacts
@@ -199,10 +200,5 @@ The root `.gitignore` is configured for this layout.
 - `assign_activate: 0x0300` enables DC SYNC0 and is useful for CSP/CSV. For
   PP/PV-only diagnosis, temporarily testing `assign_activate: 0x0000` can help
   separate DC timing issues from wiring/power issues.
-- Do not upload `build/`, `install/`, or `log/`; regenerate them locally.
-
-## License Notes
-
-The ROS 2 package metadata uses Apache-2.0 where applicable. The SOEM route
-vendors SOEM under `src/MPK_SOEM/third_party/SOEM`; check SOEM's upstream
-license terms before redistribution or commercial use.
+- Do not upload `build/`, `install/`, `log/`, or `docs/`; regenerate runtime
+  outputs locally and keep private notes outside Git.
