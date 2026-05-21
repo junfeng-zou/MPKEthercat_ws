@@ -26,7 +26,8 @@ multi_motor_control/
 ├── multi_motor_control/              # Python module (rqt plugin code)
 │   ├── __init__.py
 │   ├── cia402.py                     # state-machine helpers (pure Python)
-│   └── my_motor_rqt_plugin.py        # RosBridge + MultiMotorWidget + Plugin
+│   ├── my_motor_rqt_plugin.py        # RosBridge + MultiMotorWidget + Plugin
+│   └── unit_converter.py             # ROS degree API <-> drive counts
 ├── launch/
 │   └── multi_motor_control.launch.py
 ├── config/
@@ -90,6 +91,7 @@ ros2 launch multi_motor_control multi_motor_control.launch.py
 #   urdf_file:=multi_motor.urdf.xacro
 #   controllers_file:=controllers.yaml
 #   slave_config_file:=ethercat_system.yaml
+#   encoder_resolution:=865075.2
 
 # 2) In another terminal, open the GUI
 rqt --force-discover
@@ -127,7 +129,54 @@ explicitly click **Enable** to walk the CiA 402 state machine.
 
 `pp_controller`, `csp_controller`, `csv_controller`, `pv_controller` are **mutually exclusive**
 and spawned **inactive**. The GUI calls `/controller_manager/switch_controller`
-under the hood when you click *Apply* after picking a mode.
+under the hood when you click *Apply* after picking a mode. GUI motion
+setpoints are entered in degrees and published through the ROS degree API
+below; `unit_converter` forwards them to the low-level controller topics.
+
+---
+
+## ROS degree API
+
+The EtherCAT/CiA 402 layer still uses drive-native `counts` and `counts/s`.
+For higher-level software, `multi_motor_control.launch.py` also starts
+`unit_converter`, which assumes a 17-bit motor encoder with a 6.6:1 gearbox
+by default. The conversion uses the effective output-shaft resolution:
+
+```text
+encoder_resolution = 131072 * 6.6 = 865075.2 counts/output-rev
+```
+
+Command topics exposed in degree units:
+
+```text
+/multi_motor/pp_position_deg/commands       -> /pp_controller/commands
+/multi_motor/csp_position_deg/commands      -> /csp_controller/commands
+/multi_motor/csv_velocity_deg_s/commands    -> /csv_controller/commands
+/multi_motor/pv_velocity_deg_s/commands     -> /pv_controller/commands
+```
+
+All command topics use `std_msgs/msg/Float64MultiArray` with one value per
+joint, ordered as `joint_1 ... joint_N`. Feedback is published as
+`control_msgs/msg/DynamicJointState`:
+
+```text
+/multi_motor/states_deg
+  interface_names: [position_deg, velocity_deg_s]
+```
+
+The conversion is:
+
+```text
+counts   = round(deg   * encoder_resolution / 360.0)
+deg      = counts      * 360.0 / encoder_resolution
+counts/s = round(deg/s * encoder_resolution / 360.0)
+deg/s    = counts/s    * 360.0 / encoder_resolution
+```
+
+The degree API only converts units. Drive enabling, mode selection, and
+controller activation are still handled through the CiA 402 command/mode
+controllers and `/controller_manager/switch_controller`. The rqt/standalone
+GUI also uses these degree command and feedback topics.
 
 ---
 

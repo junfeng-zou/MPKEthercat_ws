@@ -18,15 +18,15 @@ Architecture
                                  thread, talks to Qt via signals
 Topic / service summary
 -----------------------
-  /joint_states                          (sub)  position & velocity
+  /multi_motor/states_deg                (sub)  position_deg & velocity_deg_s
   /dynamic_joint_states                  (sub)  status_word, mode disp
   /cia402_cmd_controller/commands        (pub)  Control Word array
   /cia402_mode_controller/commands       (pub)  Mode array
   /fault_reset_controller/commands       (pub)  reset_fault pulse
-  /pp_controller/commands                (pub)  profile-position target
-  /csp_controller/commands               (pub)  position setpoint
-  /csv_controller/commands               (pub)  velocity setpoint
-  /pv_controller/commands                (pub)  target velocity in PV mode
+  /multi_motor/pp_position_deg/commands       (pub)  profile-position target
+  /multi_motor/csp_position_deg/commands      (pub)  position setpoint
+  /multi_motor/csv_velocity_deg_s/commands    (pub)  velocity setpoint
+  /multi_motor/pv_velocity_deg_s/commands     (pub)  target velocity in PV mode
   /controller_manager/list_controllers   (srv)
   /controller_manager/switch_controller  (srv)
 """
@@ -42,7 +42,6 @@ import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 
-from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from control_msgs.msg import DynamicJointState
 from controller_manager_msgs.srv import ListControllers, SwitchController
@@ -77,7 +76,7 @@ class RosBridge(QObject):
 
     Public Qt signals
     -----------------
-      joint_state_updated(list[float] pos_counts, list[float] vel_counts_s)
+      joint_state_updated(list[float] pos_deg, list[float] vel_deg_s)
       dynamic_state_updated(list[int] status_words, list[int] mode_disp)
       controllers_updated(dict[str, str] name -> state)
       log_message(str level, str msg)
@@ -141,17 +140,18 @@ class RosBridge(QObject):
             Float64MultiArray, '/fault_reset_controller/commands', 10)
 
         self._pub_pp   = n.create_publisher(
-            Float64MultiArray, '/pp_controller/commands', 10)
+            Float64MultiArray, '/multi_motor/pp_position_deg/commands', 10)
         self._pub_csp  = n.create_publisher(
-            Float64MultiArray, '/csp_controller/commands', 10)
+            Float64MultiArray, '/multi_motor/csp_position_deg/commands', 10)
         self._pub_csv  = n.create_publisher(
-            Float64MultiArray, '/csv_controller/commands', 10)
+            Float64MultiArray, '/multi_motor/csv_velocity_deg_s/commands', 10)
         self._pub_pv   = n.create_publisher(
-            Float64MultiArray, '/pv_controller/commands', 10)
+            Float64MultiArray, '/multi_motor/pv_velocity_deg_s/commands', 10)
 
         # ---- subscribers ----
         n.create_subscription(
-            JointState, '/joint_states', self._cb_joint_state, 10)
+            DynamicJointState, '/multi_motor/states_deg',
+            self._cb_degree_state, 10)
         n.create_subscription(
             DynamicJointState, '/dynamic_joint_states',
             self._cb_dynamic_state, 10)
@@ -168,14 +168,18 @@ class RosBridge(QObject):
     # ------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------
-    def _cb_joint_state(self, msg: JointState):
+    def _cb_degree_state(self, msg: DynamicJointState):
         pos = [0.0] * self._num
         vel = [0.0] * self._num
-        for jn, p, v in zip(msg.name, msg.position, msg.velocity):
-            if jn in self._joint_names:
-                i = self._joint_names.index(jn)
-                pos[i] = p
-                vel[i] = v
+        for jn, ifv in zip(msg.joint_names, msg.interface_values):
+            if jn not in self._joint_names:
+                continue
+            i = self._joint_names.index(jn)
+            for name, val in zip(ifv.interface_names, ifv.values):
+                if name == 'position_deg':
+                    pos[i] = val
+                elif name == 'velocity_deg_s':
+                    vel[i] = val
         self.joint_state_updated.emit(pos, vel)
 
     def _cb_dynamic_state(self, msg: DynamicJointState):
@@ -285,14 +289,15 @@ class MotorPanel(QGroupBox):
         ('PV  (Profile Velocity)',     MODE.PROFILE_VELOCITY),
     ]
 
-    # Slider/Spinbox 允许的位置范围，以编码器转数为单位。
+    # Slider/Spinbox 允许的位置范围，以输出轴转数为单位。
     # 默认 ±5 圈，足够常规调试且不会一不小心把电机撞飞。
     POS_RANGE_REVS = 5
-    # 速度目标范围：±5 圈/秒（counts/s），可按需放宽。
+    # 速度目标范围：±5 圈/秒，可按需放宽。
     VEL_RANGE_REVS_PER_S = 5
+    POS_SLIDER_SCALE = 10  # slider integer step = 0.1 deg
 
     def __init__(self, joint_name: str, index: int,
-                 encoder_resolution: int, parent=None):
+                 encoder_resolution: float, parent=None):
         super().__init__(joint_name, parent)
         self.joint_name = joint_name
         self.index = index
@@ -300,8 +305,8 @@ class MotorPanel(QGroupBox):
 
         self._cached_status_word = 0
         self._cached_mode_disp   = 0
-        self._cached_pos_counts   = 0
-        self._cached_vel_counts_s = 0
+        self._cached_pos_deg     = 0.0
+        self._cached_vel_deg_s   = 0.0
 
         self._build_ui()
 
@@ -328,12 +333,12 @@ class MotorPanel(QGroupBox):
         row += 1
 
         s.addWidget(QLabel('Position:'), row, 0)
-        self.lbl_pos = QLabel('0 cnt')
+        self.lbl_pos = QLabel('0.000 deg')
         s.addWidget(self.lbl_pos, row, 1)
         row += 1
 
         s.addWidget(QLabel('Velocity:'), row, 0)
-        self.lbl_vel = QLabel('0 cnt/s')
+        self.lbl_vel = QLabel('0.000 deg/s')
         s.addWidget(self.lbl_vel, row, 1)
 
         gb_status = QGroupBox('Status')
@@ -364,23 +369,24 @@ class MotorPanel(QGroupBox):
         root.addLayout(mode_row)
 
         # ---- CSP controls ----------------------------
-        # 位置目标单位：编码器 counts (对应 0x607a Target Position, int32)
-        pos_limit = self.POS_RANGE_REVS * self.encoder_resolution
-        pos_step  = max(1, self.encoder_resolution // 100)   # 每次约 0.01 圈
+        # 位置目标单位：角度。ROS 层 unit_converter 负责 deg -> counts。
+        pos_limit_deg = self.POS_RANGE_REVS * 360.0
+        pos_slider_limit = int(pos_limit_deg * self.POS_SLIDER_SCALE)
 
-        gb_csp = QGroupBox('PP / CSP - Position setpoint (encoder counts)')
+        gb_csp = QGroupBox('PP / CSP - Position setpoint (deg)')
         csp = QVBoxLayout(gb_csp)
         csp_row = QHBoxLayout()
         self.sld_pos = QSlider(Qt.Horizontal)
-        self.sld_pos.setRange(-pos_limit, pos_limit)
-        self.sld_pos.setSingleStep(pos_step)
-        self.sld_pos.setPageStep(pos_step * 10)
+        self.sld_pos.setRange(-pos_slider_limit, pos_slider_limit)
+        self.sld_pos.setSingleStep(1)
+        self.sld_pos.setPageStep(10)
         self.sld_pos.setValue(0)
         csp_row.addWidget(self.sld_pos, 1)
-        self.spn_pos = QSpinBox()
-        self.spn_pos.setRange(-pos_limit, pos_limit)
-        self.spn_pos.setSingleStep(pos_step)
-        self.spn_pos.setSuffix(' cnt')
+        self.spn_pos = QDoubleSpinBox()
+        self.spn_pos.setDecimals(3)
+        self.spn_pos.setRange(-pos_limit_deg, pos_limit_deg)
+        self.spn_pos.setSingleStep(1.0)
+        self.spn_pos.setSuffix(' deg')
         self.spn_pos.setGroupSeparatorShown(True)
         csp_row.addWidget(self.spn_pos)
         csp.addLayout(csp_row)
@@ -399,17 +405,16 @@ class MotorPanel(QGroupBox):
         root.addWidget(gb_csp)
 
         # ---- CSV / PV controls -----------------------
-        # 速度目标单位：编码器 counts/s (对应 0x60ff Target Velocity；
-        # CSV 和 PV 都使用这个 CiA 402 对象，只是 mode_of_operation 不同)
-        vel_limit = self.VEL_RANGE_REVS_PER_S * self.encoder_resolution
-        vel_step  = max(1, self.encoder_resolution // 100)
+        # 速度目标单位：deg/s。ROS 层 unit_converter 负责 deg/s -> counts/s。
+        vel_limit_deg_s = self.VEL_RANGE_REVS_PER_S * 360.0
 
-        gb_vel = QGroupBox('CSV / PV - Velocity setpoint (encoder counts/s)')
+        gb_vel = QGroupBox('CSV / PV - Velocity setpoint (deg/s)')
         vel = QHBoxLayout(gb_vel)
-        self.spn_vel = QSpinBox()
-        self.spn_vel.setRange(-vel_limit, vel_limit)
-        self.spn_vel.setSingleStep(vel_step)
-        self.spn_vel.setSuffix(' cnt/s')
+        self.spn_vel = QDoubleSpinBox()
+        self.spn_vel.setDecimals(3)
+        self.spn_vel.setRange(-vel_limit_deg_s, vel_limit_deg_s)
+        self.spn_vel.setSingleStep(10.0)
+        self.spn_vel.setSuffix(' deg/s')
         self.spn_vel.setGroupSeparatorShown(True)
         vel.addWidget(self.spn_vel, 1)
         self.btn_send_vel = QPushButton('Send (one-shot)')
@@ -418,8 +423,11 @@ class MotorPanel(QGroupBox):
         root.addWidget(gb_vel)
 
         # ---- slider/spin linkage ---------------------
-        self.sld_pos.valueChanged.connect(self.spn_pos.setValue)
-        self.spn_pos.valueChanged.connect(self.sld_pos.setValue)
+        self.sld_pos.valueChanged.connect(
+            lambda v: self.spn_pos.setValue(v / self.POS_SLIDER_SCALE))
+        self.spn_pos.valueChanged.connect(
+            lambda v: self.sld_pos.setValue(
+                int(round(v * self.POS_SLIDER_SCALE))))
 
     # ------------------------------------------------------
     # public getters
@@ -427,21 +435,21 @@ class MotorPanel(QGroupBox):
     def selected_mode(self) -> int:
         return self.MODES_UI[self.cmb_mode.currentIndex()][1]
 
-    def position_setpoint_counts(self) -> int:
-        """CSP 目标位置，单位：编码器 counts (0x607a)"""
-        return int(self.spn_pos.value())
+    def position_setpoint_deg(self) -> float:
+        """PP/CSP 目标位置，单位：deg。"""
+        return float(self.spn_pos.value())
 
-    def velocity_setpoint_counts_s(self) -> int:
-        """CSV/PV 目标速度，单位：编码器 counts/s (0x60ff)"""
-        return int(self.spn_vel.value())
+    def velocity_setpoint_deg_s(self) -> float:
+        """CSV/PV 目标速度，单位：deg/s。"""
+        return float(self.spn_vel.value())
 
     # ------------------------------------------------------
     # alignment helpers
     # ------------------------------------------------------
-    def align_setpoint_to_feedback(self) -> int:
+    def align_setpoint_to_feedback(self) -> float:
         """
-        指令初始化对齐：把 CSP 的位置 spinbox/slider 强制设置为
-        当前反馈位置 (`_cached_pos_counts`)，并把 spin/slider 的
+        指令初始化对齐：把 PP/CSP 的位置 spinbox/slider 强制设置为
+        当前反馈位置 (`_cached_pos_deg`)，并把 spin/slider 的
         允许范围动态调整为「当前位置 ± POS_RANGE_REVS 圈」。
 
         必须在以下两个时机调用：
@@ -450,19 +458,21 @@ class MotorPanel(QGroupBox):
           2. 开始 CSP streaming 前：保证 _tick_csp_stream 发出的
              第一帧位置指令 = 当前反馈位置，避免电机阶跃。
 
-        返回对齐后的目标值（cnt）。
+        返回对齐后的目标值（deg）。
         """
-        cur = int(self._cached_pos_counts)
-        span = self.POS_RANGE_REVS * self.encoder_resolution
+        cur = float(self._cached_pos_deg)
+        span = self.POS_RANGE_REVS * 360.0
         new_min = cur - span
         new_max = cur + span
+        new_min_slider = int(round(new_min * self.POS_SLIDER_SCALE))
+        new_max_slider = int(round(new_max * self.POS_SLIDER_SCALE))
         # 阻止 valueChanged 在 setRange/setValue 期间产生抖动信号
         self.sld_pos.blockSignals(True)
         self.spn_pos.blockSignals(True)
         try:
-            self.sld_pos.setRange(new_min, new_max)
+            self.sld_pos.setRange(new_min_slider, new_max_slider)
             self.spn_pos.setRange(new_min, new_max)
-            self.sld_pos.setValue(cur)
+            self.sld_pos.setValue(int(round(cur * self.POS_SLIDER_SCALE)))
             self.spn_pos.setValue(cur)
         finally:
             self.sld_pos.blockSignals(False)
@@ -487,18 +497,17 @@ class MotorPanel(QGroupBox):
                                     or st.ready_to_switch_on)
         self.btn_reset_fault.setEnabled(st.fault)
 
-    def update_joint_state(self, pos_counts: float, vel_counts_s: float):
+    def update_joint_state(self, pos_deg: float, vel_deg_s: float):
         """
-        /joint_states 的 position/velocity 字段实际上是由 EcCiA402Drive
-        直接透传的 0x6064 / 0x606c（int32, 单位: counts / (counts/s)）。
-        这里按编码器单位原样显示，同时附带换算后的转数便于直观理解。
+        /multi_motor/states_deg 由 unit_converter 从底层 counts 换算而来。
+        GUI 只显示和下发角度单位。
         """
-        self._cached_pos_counts   = int(pos_counts)
-        self._cached_vel_counts_s = int(vel_counts_s)
-        revs = pos_counts / self.encoder_resolution if self.encoder_resolution else 0.0
-        rps  = vel_counts_s / self.encoder_resolution if self.encoder_resolution else 0.0
-        self.lbl_pos.setText(f'{self._cached_pos_counts:+d} cnt   ({revs:+.3f} rev)')
-        self.lbl_vel.setText(f'{self._cached_vel_counts_s:+d} cnt/s ({rps:+.3f} rev/s)')
+        self._cached_pos_deg = float(pos_deg)
+        self._cached_vel_deg_s = float(vel_deg_s)
+        revs = pos_deg / 360.0
+        rps = vel_deg_s / 360.0
+        self.lbl_pos.setText(f'{pos_deg:+.3f} deg   ({revs:+.3f} rev)')
+        self.lbl_vel.setText(f'{vel_deg_s:+.3f} deg/s ({rps:+.3f} rev/s)')
 
     @property
     def status_word(self) -> int:
@@ -520,7 +529,7 @@ class MultiMotorWidget(QWidget):
 
     # Default layout, can be overridden at construction time.
     DEFAULT_JOINTS = ['joint_1', 'joint_2', 'joint_3', 'joint_4']
-    DEFAULT_ENCODER_RES = 1048576    # 2^20
+    DEFAULT_ENCODER_RES = 865075.2   # 2^17 * 6.6 gearbox
 
     # Mode -> motion-controller name
     MODE_CTRL = {
@@ -545,7 +554,7 @@ class MultiMotorWidget(QWidget):
 
     def __init__(self,
                  joint_names: Optional[List[str]] = None,
-                 encoder_resolution: int = DEFAULT_ENCODER_RES,
+                 encoder_resolution: float = DEFAULT_ENCODER_RES,
                  parent=None):
         super().__init__(parent)
         self.joint_names = joint_names or self.DEFAULT_JOINTS
@@ -728,7 +737,7 @@ class MultiMotorWidget(QWidget):
             cur = self.panels[idx].align_setpoint_to_feedback()
             self._log(
                 f'{self.joint_names[idx]}: position setpoint '
-                f'aligned to feedback @ {cur:+d} cnt')
+                f'aligned to feedback @ {cur:+.3f} deg')
 
         # ---- Step 3+4: 延迟 300 ms 等 mode 生效，再走状态机 ----
         QTimer.singleShot(
@@ -820,18 +829,18 @@ class MultiMotorWidget(QWidget):
         if target_mode == MODE.CSP:
             # 发送当前反馈位置，覆盖 command_interface 中可能的陈旧值
             cur = self.panels[idx].align_setpoint_to_feedback()
-            cur_pos_vec = [float(p._cached_pos_counts) for p in self.panels]
+            cur_pos_vec = [float(p._cached_pos_deg) for p in self.panels]
 
             def _publish_and_switch():
                 # 连续发送位置确保 controller 收到
                 self.bridge.publish_csp(cur_pos_vec)
                 self._log(
                     f'{self.joint_names[idx]}: CSP position = '
-                    f'{cur:+d} cnt, waiting for CI to stabilize...')
+                    f'{cur:+.3f} deg, waiting for CI to stabilize...')
 
                 def _inject_csp_mode():
                     # 再发一次位置确保万无一失
-                    fresh_pos = [float(p._cached_pos_counts)
+                    fresh_pos = [float(p._cached_pos_deg)
                                  for p in self.panels]
                     self.bridge.publish_csp(fresh_pos)
                     # 现在注入 CSP 模式
@@ -963,7 +972,7 @@ class MultiMotorWidget(QWidget):
         if target_mode == MODE.PROFILE_POSITION:
             cur = self.panels[idx].align_setpoint_to_feedback()
             self._log(f'{self.joint_names[idx]}: PP setpoint '
-                      f'aligned to feedback {cur:+d} cnt')
+                      f'aligned to feedback {cur:+.3f} deg')
 
         if target_mode == MODE.CSP:
             # CSP 安全切换时序：
@@ -973,7 +982,7 @@ class MultiMotorWidget(QWidget):
             # 4. 最后再注入 CSP 模式
             cur = self.panels[idx].align_setpoint_to_feedback()
             self._log(f'{self.joint_names[idx]}: CSP setpoint '
-                      f'aligned to feedback {cur:+d} cnt')
+                      f'aligned to feedback {cur:+.3f} deg')
 
             to_deact = [c for c in self.ALL_MOTION_CTRLS
                         if c != target_ctrl and c == self._active_ctrl]
@@ -986,14 +995,14 @@ class MultiMotorWidget(QWidget):
             self._log(f'{self.joint_names[idx]}: activated {target_ctrl}')
 
             def _publish_and_inject():
-                pos_vec = [float(p._cached_pos_counts) for p in self.panels]
+                pos_vec = [float(p._cached_pos_deg) for p in self.panels]
                 self.bridge.publish_csp(pos_vec)
                 self._log(
                     f'{self.joint_names[idx]}: published CSP position, '
                     f'waiting for CI to stabilize...')
 
                 def _inject():
-                    fresh = [float(p._cached_pos_counts)
+                    fresh = [float(p._cached_pos_deg)
                              for p in self.panels]
                     self.bridge.publish_csp(fresh)
                     mvec = [float(p.mode_display or MODE.NO_MODE)
@@ -1033,8 +1042,8 @@ class MultiMotorWidget(QWidget):
                       'click "Apply" after selecting PP first.', 'warn')
             return
 
-        target = self.panels[idx].position_setpoint_counts()
-        vec = [float(p._cached_pos_counts) for p in self.panels]
+        target = self.panels[idx].position_setpoint_deg()
+        vec = [float(p._cached_pos_deg) for p in self.panels]
         vec[idx] = float(target)
         self.bridge.publish_pp(vec)
 
@@ -1044,7 +1053,7 @@ class MultiMotorWidget(QWidget):
         cw_start[idx] = float(
             CW.ENABLE_OPERATION | CW.NEW_SET_POINT | CW.CHANGE_IMMEDIATE)
         self.bridge.publish_control_word(cw_start)
-        self._log(f'{self.joint_names[idx]}: PP target {target:+d} cnt')
+        self._log(f'{self.joint_names[idx]}: PP target {target:+.3f} deg')
 
         def _clear_new_set_point():
             cw_hold = self._current_cw_vector()
@@ -1066,7 +1075,7 @@ class MultiMotorWidget(QWidget):
         # 提前 setValue 即可保证首帧 setpoint == 当前 feedback。
         cur = self.panels[idx].align_setpoint_to_feedback()
         self._log(f'{self.joint_names[idx]}: CSP stream start, '
-                  f'first setpoint aligned to {cur:+d} cnt')
+                  f'first setpoint aligned to {cur:+.3f} deg')
 
         self._streaming_csp[idx] = True
         self.panels[idx].btn_stream_start.setEnabled(False)
@@ -1088,25 +1097,25 @@ class MultiMotorWidget(QWidget):
         we always fill the whole vector - joints not streaming
         keep their last measured position (no movement).
 
-        目标位置以编码器 counts 直接写入 position 接口（对应 0x607a）。
+        目标位置以 deg 写入 unit_converter，再由其转换到底层 counts。
         """
-        vec = [float(p._cached_pos_counts) for p in self.panels]
+        vec = [float(p._cached_pos_deg) for p in self.panels]
         for i, streaming in enumerate(self._streaming_csp):
             if streaming:
-                vec[i] = float(self.panels[i].position_setpoint_counts())
+                vec[i] = float(self.panels[i].position_setpoint_deg())
         self.bridge.publish_csp(vec)
 
     # ---- Velocity one-shot ----
     def _on_send_vel(self, idx: int):
-        v = self.panels[idx].velocity_setpoint_counts_s()
+        v = self.panels[idx].velocity_setpoint_deg_s()
         if self._active_ctrl == 'csv_controller':
             self._csv_targets[idx] = float(v)
             self.bridge.publish_csv(self._csv_targets)
-            self._log(f'{self.joint_names[idx]}: CSV {v:+d} cnt/s')
+            self._log(f'{self.joint_names[idx]}: CSV {v:+.3f} deg/s')
         elif self._active_ctrl == 'pv_controller':
             self._pv_targets[idx] = float(v)
             self.bridge.publish_pv(self._pv_targets)
-            self._log(f'{self.joint_names[idx]}: PV {v:+d} cnt/s')
+            self._log(f'{self.joint_names[idx]}: PV {v:+.3f} deg/s')
         else:
             self._log('Select CSV or PV mode and press Apply first.', 'warn')
 

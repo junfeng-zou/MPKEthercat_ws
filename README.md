@@ -46,8 +46,11 @@ drives by default and supports:
 | CSP  | 8             | `0x607A` Target Position |
 | CSV  | 9             | `0x60FF` Target Velocity |
 
-The GUI uses `/dynamic_joint_states` for drive status and standard ROS 2
-controller topics for commands.
+The GUI uses `/dynamic_joint_states` for drive status and the ROS-level
+degree API under `/multi_motor/*` for motion commands and feedback. The
+launch file starts `unit_converter` with the 20-bit position-unit default
+`encoder_resolution = 1048576`, which forwards degree commands to the
+low-level ros2_control topics.
 
 ### ROS 2 Build
 

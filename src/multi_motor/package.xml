@@ -5,7 +5,7 @@
   <name>multi_motor_control</name>
   <version>1.0.0</version>
   <description>Denali XCR multi-motor CiA 402 control via ros2_control + rqt.</description>
-  <maintainer email="zjf@local">zjf</maintainer>
+  <maintainer email="zjf@local.dev">zjf</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

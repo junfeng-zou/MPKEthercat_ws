@@ -12,6 +12,7 @@ Order of operations
   5. spawn cia402_mode_controller         (active)
   6. spawn fault_reset_controller         (active)
   7. spawn pp/csp/csv/pv controllers      (INACTIVE - GUI will activate)
+  8. unit_converter                       (degree API <-> drive counts)
 
 Because the YAML sets Control Word default=0 AND cia402_cmd_controller
 is active with no command published, the drives stay in
@@ -47,6 +48,9 @@ def generate_launch_description():
         DeclareLaunchArgument('slave_config_file',
             default_value='ethercat_system.yaml',
             description='slave config filename under <pkg>/config/'),
+        DeclareLaunchArgument('encoder_resolution',
+            default_value='865075.2',
+            description='Counts per output revolution for degree conversion.'),
     ]
 
     # ---- absolute paths ----
@@ -85,6 +89,18 @@ def generate_launch_description():
         package='robot_state_publisher',
         executable='robot_state_publisher',
         parameters=[robot_description],
+        output='screen',
+    )
+
+    unit_converter = Node(
+        package='multi_motor_control',
+        executable='unit_converter',
+        parameters=[{
+            'num_joints': ParameterValue(
+                LaunchConfiguration('num_joints'), value_type=int),
+            'encoder_resolution': ParameterValue(
+                LaunchConfiguration('encoder_resolution'), value_type=float),
+        }],
         output='screen',
     )
 
@@ -133,6 +149,8 @@ def generate_launch_description():
                       on_exit=[
             LogInfo(msg='=========================================='),
             LogInfo(msg='All controllers loaded.'),
+            LogInfo(msg='ROS degree API is available under /multi_motor/* '
+                        '(encoder_resolution=865075.2 by default).'),
             LogInfo(msg='Drives are held in "Switch On Disabled" '
                         '(Control Word default=0).'),
             LogInfo(msg='Use rqt -> Robot -> Multi-Motor Control '
@@ -143,6 +161,7 @@ def generate_launch_description():
     return LaunchDescription(declared + [
         control_node,
         robot_state_publisher,
+        unit_converter,
         jsb_spawner,
         delay_cia402_after_jsb,
         delay_motion_after_cia402,

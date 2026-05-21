@@ -42,6 +42,9 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
+            # ROS-level degree <-> encoder-count bridge for higher layers.
+            'unit_converter = '
+                'multi_motor_control.unit_converter:main',
             # Allow running the widget standalone for quick tests:
             #   ros2 run multi_motor_control my_motor_rqt_plugin
             'my_motor_rqt_plugin = '
