@@ -4,14 +4,8 @@ EtherCAT motor-control codebase for MPK/Denali XCR CiA 402 drives.
 
 Maintained by **zjf**.
 
-This repository keeps two implementation routes side by side:
-
-- **ROS 2 route**: IgH EtherCAT master + `ros2_control` + rqt GUI.
-- **SOEM route**: standalone CMake/SOEM controller without ROS 2.
-
-The ROS 2 route is the maintained daily development path. The SOEM route is
-kept as an independent lower-level implementation for comparison, diagnosis,
-and non-ROS experiments.
+The maintained implementation uses the IgH EtherCAT master, `ros2_control`,
+and an rqt GUI under ROS 2.
 
 ## Repository Layout
 
@@ -19,16 +13,14 @@ and non-ROS experiments.
 .
 ├── src/
 │   ├── ethercat_driver_ros2/    # EtherCAT ROS 2 driver stack, vendored as source
-│   ├── multi_motor/             # Main ROS 2 multi-motor control package
-│   ├── MPK_SOEM/                # Standalone SOEM route, built with CMake
-│   └── ethercat.json            # PDO mapping reference
+│   └── multi_motor/             # Main ROS 2 multi-motor control package
 ├── docs/                        # Project notes and integration docs
 ├── legacy/                      # Archived early test code, not tracked/uploaded
 ├── build/ install/ log/         # Local colcon outputs, ignored by Git
 └── log.md                       # Human-written project/debug notes
 ```
 
-## Route 1: ROS 2 + IgH + ros2_control
+## ROS 2 + IgH + ros2_control
 
 Main package:
 
@@ -36,8 +28,8 @@ Main package:
 src/multi_motor
 ```
 
-This package is installed as `multi_motor_control`. It controls four Denali XCR
-drives by default and supports:
+This package is installed as `multi_motor_control`. It controls five Denali XCR
+drives by default: one ball-screw linear axis and four rotary axes. It supports:
 
 | Mode | CiA 402 value | Target object |
 |------|---------------|---------------|
@@ -46,11 +38,10 @@ drives by default and supports:
 | CSP  | 8             | `0x607A` Target Position |
 | CSV  | 9             | `0x60FF` Target Velocity |
 
-The GUI uses `/dynamic_joint_states` for drive status and the ROS-level
-degree API under `/multi_motor/*` for motion commands and feedback. The
-launch file starts `unit_converter` with the 20-bit position-unit default
-`encoder_resolution = 1048576`, which forwards degree commands to the
-low-level ros2_control topics.
+The GUI uses `/dynamic_joint_states` for drive status and the ROS-level API
+under `/multi_motor/*` for motion commands and feedback. The launch file starts
+`unit_converter`, which converts the linear axis to mm and the rotary axes to
+degrees before forwarding commands to the low-level ros2_control topics.
 
 ### ROS 2 Build
 
@@ -100,55 +91,6 @@ More details are in:
 src/multi_motor/README.md
 ```
 
-## Route 2: Standalone SOEM
-
-Main directory:
-
-```text
-src/MPK_SOEM
-```
-
-This is not a ROS package and is intentionally skipped by colcon via
-`src/MPK_SOEM/COLCON_IGNORE`.
-
-It vendors SOEM under:
-
-```text
-src/MPK_SOEM/third_party/SOEM
-```
-
-### SOEM Build
-
-```bash
-cd src/MPK_SOEM
-cmake -S . -B build
-cmake --build build -j
-ctest --test-dir build
-```
-
-### SOEM Run
-
-SOEM uses raw sockets, so runtime usually needs `sudo` or equivalent
-`CAP_NET_RAW` permissions.
-
-```bash
-ip link
-sudo ./build/mpk_soem_four_motor --ifname enp3s0 --mode idle
-```
-
-Native GUI:
-
-```bash
-sudo -E ./build/mpk_soem_gui
-```
-
-More details are in:
-
-```text
-src/MPK_SOEM/README.md
-src/MPK_SOEM/README_CN.md
-```
-
 ## Important Directories
 
 `src/ethercat_driver_ros2`
@@ -162,11 +104,6 @@ src/MPK_SOEM/README_CN.md
 : Main maintained ROS 2 application. It contains the launch files, xacro URDF,
   EtherCAT slave YAML, controller YAML, and rqt/standalone GUI.
 
-`src/MPK_SOEM`
-
-: Independent SOEM implementation. It is useful for separating EtherCAT/drive
-  behavior from ROS 2 and controller-manager behavior.
-
 `legacy`
 
 : Old early-stage test package. It is kept locally for reference, but ignored
@@ -179,7 +116,6 @@ Tracked source should include:
 - `README.md` and source/config files
 - `src/multi_motor/`
 - `src/ethercat_driver_ros2/`
-- `src/MPK_SOEM/`
 - project config files such as `.gitignore`
 
 Ignored local/generated data:
@@ -189,6 +125,7 @@ Ignored local/generated data:
 - `log/`
 - `docs/`
 - `legacy/`
+- `src/MPK_SOEM/`
 - editor and assistant state: `.vscode/`, `.codex/`, `.agents/`
 - Python caches and compiled artifacts
 

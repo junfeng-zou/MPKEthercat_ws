@@ -180,8 +180,8 @@ counts/s = round(deg/s * encoder_resolution / 360.0)
 deg/s    = counts/s    * 360.0 / encoder_resolution
 ```
 
-The default linear conversion for `joint_1` comes from the SOEM side of this
-project:
+The default linear conversion for `joint_1` comes from the static joint
+geometry configuration:
 
 ```text
 encoder_counts_per_rev = 131072

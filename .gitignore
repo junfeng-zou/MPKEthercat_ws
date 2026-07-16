@@ -4,7 +4,7 @@
 /log/
 /legacy/
 /docs/
-/src/MPK_SOEM/build/
+/src/MPK_SOEM/
 
 # Python caches
 __pycache__/
@@ -17,8 +17,6 @@ __pycache__/
 # C/C++ build byproducts
 *.o
 *.a
-!/src/MPK_SOEM/third_party/SOEM/oshw/win32/wpcap/Lib/libpacket.a
-!/src/MPK_SOEM/third_party/SOEM/oshw/win32/wpcap/Lib/libwpcap.a
 *.so
 *.dylib
 *.dll
