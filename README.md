@@ -16,8 +16,7 @@ and an rqt GUI under ROS 2.
 │   └── multi_motor/             # Main ROS 2 multi-motor control package
 ├── docs/                        # Project notes and integration docs
 ├── legacy/                      # Archived early test code, not tracked/uploaded
-├── build/ install/ log/         # Local colcon outputs, ignored by Git
-└── log.md                       # Human-written project/debug notes
+└── build/ install/ log/         # Local colcon outputs, ignored by Git
 ```
 
 ## ROS 2 + IgH + ros2_control
