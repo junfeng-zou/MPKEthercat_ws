@@ -14,8 +14,9 @@ Supported control modes (switchable at runtime from the GUI):
 | CSV  | 9            | `velocity_controllers/JointGroupVelocityController` | 0x60FF |
 | PV   | 3            | `forward_command_controller/ForwardCommandController` | 0x60FF |
 
-Motor count is parametric: `num_joints` defaults to **4** and scales up to **8**
-without changing any code, only the `controllers.yaml` joint list.
+Motor count is parametric: `num_joints` defaults to **5**. In the default
+layout `joint_1` is a ball-screw linear axis in mm, while `joint_2..joint_5`
+are the four rotary axes.
 
 ---
 
@@ -86,12 +87,13 @@ source install/setup.bash
 ros2 launch multi_motor_control multi_motor_control.launch.py
 
 # Optional overrides:
-#   num_joints:=6
+#   num_joints:=5
 #   master_id:=0
 #   urdf_file:=multi_motor.urdf.xacro
 #   controllers_file:=controllers.yaml
 #   slave_config_file:=ethercat_system.yaml
 #   encoder_resolution:=865075.2
+#   position_limits_file:=/path/to/calibrate.json
 
 # 2) In another terminal, open the GUI
 rqt --force-discover
@@ -135,7 +137,7 @@ below; `unit_converter` forwards them to the low-level controller topics.
 
 ---
 
-## ROS degree API
+## ROS position API
 
 The EtherCAT/CiA 402 layer still uses drive-native `counts` and `counts/s`.
 For higher-level software, `multi_motor_control.launch.py` also starts
@@ -146,7 +148,9 @@ by default. The conversion uses the effective output-shaft resolution:
 encoder_resolution = 131072 * 6.6 = 865075.2 counts/output-rev
 ```
 
-Command topics exposed in degree units:
+Command topics keep their historical names. Values are interpreted per joint:
+`joint_1` uses mm/mm/s when its `calibrate.json` entry has `unit: "mm"`;
+rotary joints use deg/deg/s.
 
 ```text
 /multi_motor/pp_position_deg/commands       -> /pp_controller/commands
@@ -161,10 +165,13 @@ joint, ordered as `joint_1 ... joint_N`. Feedback is published as
 
 ```text
 /multi_motor/states_deg
-  interface_names: [position_deg, velocity_deg_s]
+  interface_names:
+    [position_deg|position_mm, velocity_deg_s|velocity_mm_s, raw_position_cnt,
+     restored_position_cnt, restored_position_deg|restored_position_mm,
+     restore_offset_cnt, turn, single_cnt]
 ```
 
-The conversion is:
+Rotary conversion is:
 
 ```text
 counts   = round(deg   * encoder_resolution / 360.0)
@@ -173,10 +180,201 @@ counts/s = round(deg/s * encoder_resolution / 360.0)
 deg/s    = counts/s    * 360.0 / encoder_resolution
 ```
 
+The default linear conversion for `joint_1` comes from the SOEM side of this
+project:
+
+```text
+encoder_counts_per_rev = 131072
+screw_lead_mm_per_rev = 10.0
+mm = (count - zero_position_cnt) * linear_direction * 10.0 / 131072
+```
+
 The degree API only converts units. Drive enabling, mode selection, and
 controller activation are still handled through the CiA 402 command/mode
 controllers and `/controller_manager/switch_controller`. The rqt/standalone
 GUI also uses these degree command and feedback topics.
+
+### Restored encoder counts
+
+The Denali XCR `0x6064` position is published by `joint_state_broadcaster`.
+The launch file remaps that raw stream to:
+
+```text
+/joint_states_raw
+```
+
+`unit_converter` subscribes to `/joint_states_raw`, restores the continuous
+encoder count using the saved turn offset, and republishes:
+
+```text
+/joint_states
+  position = raw 0x6064 count
+  velocity = raw 0x606C count/s
+  effort   = restored continuous count
+```
+
+The persisted state file defaults to:
+
+```text
+<workspace>/state/multi_motor_encoder_state.json
+```
+
+With the default Denali 17-bit encoder configuration:
+
+```text
+encoder_one_turn_cnt = 131072
+```
+
+On startup, the restored count is aligned to the saved continuous count by
+adding an integer multiple of `encoder_one_turn_cnt`. During operation the
+state file is written atomically every `0.02 s` when the restored count has
+changed.
+
+To avoid overwriting good state during a drive/encoder power cycle, encoder
+state updates are gated by each joint's CiA 402 `status_word`: when the status
+word is zero or unavailable, the last restored position is held in memory and
+the state file is not written. The status word must also be fresh within
+`encoder_status_timeout_sec` so stale pre-power-loss status cannot approve new
+raw samples. When feedback becomes valid again, `unit_converter` waits at
+least `encoder_powerup_stabilize_sec` and then requires raw `0x6064` to stay
+within `encoder_raw_stable_delta_counts` for
+`encoder_raw_stable_duration_sec` before updating restored state. A raw
+`0x6064` jump larger than half an encoder turn then triggers re-alignment
+against the last trusted continuous count; file writes are delayed by
+`encoder_realign_save_holdoff_sec` after that re-alignment to avoid saving a
+transient reset value. This protects normal and most sudden stop cases, but no
+software-only method can recover motion that happens while the encoder and
+computer are both unpowered.
+
+### Position limits
+
+Joint position limits are stored in `calibrate.json`:
+
+```json
+{
+  "joint_1": {
+    "axis_type": "linear",
+    "unit": "mm",
+    "min_mm": 0.0,
+    "max_mm": 100.0,
+    "range_mm": 100.0,
+    "default_mm": 0.0,
+    "zero_position_cnt": 0.0,
+    "encoder_counts_per_rev": 131072.0,
+    "screw_lead_mm_per_rev": 10.0,
+    "linear_direction": -1.0
+  },
+  "joint_2": {
+    "min_deg": 0.0,
+    "max_deg": 147.4,
+    "range_deg": 147.4,
+    "default_deg": 0.0,
+    "home_offset_deg": 0.0
+  }
+}
+```
+
+The GUI uses each joint's calibrated min/max for the PP/CSP position slider
+and spinbox range. `unit_converter` also loads the same file and clamps
+position commands received on:
+
+```text
+/multi_motor/pp_position_deg/commands
+/multi_motor/csp_position_deg/commands
+```
+
+Those PP/CSP position command topics are interpreted in the restored
+calibrated position coordinate system. In other words, a command value should
+match the `restored_position_deg` or `restored_position_mm` feedback value you
+want the joint to reach. Before
+publishing to `/pp_controller/commands` or `/csp_controller/commands`,
+`unit_converter` converts it with:
+
+```text
+restored_raw_deg = command_deg - home_offset_deg
+restored_target_cnt = deg_to_counts(restored_raw_deg)
+drive_target_cnt = restored_target_cnt - restore_offset_cnt
+```
+
+If the restored encoder state for a joint is not ready, the PP/CSP command
+frame is rejected instead of falling back to a raw count that could jump.
+
+That means code-based control should publish calibrated position commands to the
+`/multi_motor/*_position_deg/commands` topics to get the same limit
+protection as the GUI. If code publishes directly to the lower-level
+`/pp_controller/commands` or `/csp_controller/commands` count topics, it must
+apply the limits and restored-count offset before converting to counts.
+
+When the GUI aligns PP/CSP sliders to the current pose, switches into CSP, or
+fills non-streaming joints in a CSP command vector, it uses
+`restored_position_deg`/`restored_position_mm` first and falls back to
+`position_deg`/`position_mm` only before restored feedback is available. Raw
+limit calibration still uses the raw position path directly.
+
+The GUI has **Enable All** and **Disable All** toolbar buttons for batch state
+control. **Enable All** staggers the normal per-joint enable sequence so the
+drives do not all transition at the exact same instant. **Disable All** stops
+calibration/CSP streaming and sends Disable Voltage to every joint.
+
+The GUI has a **Calibrate Linear M1** button for the first ball-screw axis.
+It does not send motion commands. Click it, manually move `joint_1` through
+its travel, then click **Save Linear M1**. The minimum physical position is
+stored as `0 mm`, and the measured travel is written as `range_mm/max_mm`.
+
+The GUI has a **Calibrate Rotary Zero M2-M5** button for initial zeroing of
+the four rotary axes. It requires those four joints to be enabled, switches
+them to CSP position mode, and ramps the raw
+position target in the negative direction at `-8 deg/s` by default. During
+calibration the GUI publishes directly to `/csp_controller/commands` in
+drive-native counts so the unhomed degree limits do not clamp the motion. A
+case where the target position is clearly ahead of feedback while feedback
+position stops progressing is treated as a minimum-limit hit, even if the
+joint started very close to that limit and barely moved. A near-zero velocity
+fault with a small negative target lead is also treated as a minimum-limit
+hit. Each joint is saved as soon as it reaches the minimum limit, then its CSP
+target is held while the remaining joints continue.
+For each completed joint, the GUI writes `home_offset_deg` and rewrites the
+usable range as `min_deg=0`, `max_deg=range_deg`. `default_deg` is treated as
+an explicit restored-coordinate absolute pose and is not derived from zero
+calibration.
+Zero calibration saves `home_offset_deg = -raw_min`, so the detected minimum
+mechanical limit maps directly to calibrated `0 deg`.
+After saving each joint, the GUI publishes that raw zero count to
+`/multi_motor/reset_encoder_restore`. `unit_converter` then clears that
+joint's restored encoder turn offset, sets its restored continuous count equal
+to the current raw count, and immediately rewrites
+`state/multi_motor_encoder_state.json`. This keeps the GUI's
+`Restored Position` at the same zero as the newly calibrated raw position.
+
+The GUI also has a **Calibrate Rotary Range M2-M5** button for measuring the
+usable rotary travel.
+It uses the same raw CSP path, first ramping each enabled joint in the negative
+direction until a limit-like stall is detected, then reversing that joint in
+the positive direction until the second limit-like stall. It updates the
+stored travel length and the software maximum around the existing zero:
+
+```text
+range_deg = raw_max - raw_min
+min_deg = 0
+max_deg = range_deg
+```
+
+Each joint switches from the negative search to the positive search as soon as
+its negative limit is detected. Completed joints have their range saved and are
+held while the remaining joints continue. If a drive faults at the positive end
+after valid motion, the fault can be treated as the positive limit and saved;
+faults during the negative search abort the range calibration because the drive
+must be manually recovered before reversing safely. Range calibration does not
+rewrite `home_offset_deg`; run **Calibrate Rotary Zero M2-M5** again only when the mechanical
+zero/minimum-limit reference itself has changed.
+
+The **Go Default** toolbar button switches M2-M5 to CSP position control and
+sends only those four rotary joints to their saved `default_deg`. M1 is held
+at its current feedback position.
+
+This stall-based limit detection is an inference, not a sensor. A physical
+limit switch, drive torque/current threshold, or CiA 402 homing method is more
+reliable and safer for production use.
 
 ---
 
@@ -213,10 +411,10 @@ and is 100 % unit-testable without ROS.
 
 ---
 
-## Extending to 8 motors
+## Extending Beyond 5 Motors
 
 1. `ros2 launch multi_motor_control multi_motor_control.launch.py num_joints:=8`
-2. Append `joint_5 ... joint_8` to every `joints:` list in
+2. Append `joint_6 ... joint_8` to every `joints:` list in
    `config/controllers.yaml` (all controller `joints:` lists).
 3. Adjust `DEFAULT_JOINTS` in `multi_motor_control/my_motor_rqt_plugin.py`
    or pass a custom `joint_names` list when constructing

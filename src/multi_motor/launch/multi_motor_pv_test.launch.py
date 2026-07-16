@@ -42,7 +42,7 @@ def generate_launch_description():
     pkg = FindPackageShare('multi_motor_control')
 
     declared = [
-        DeclareLaunchArgument('num_joints',    default_value='4'),
+        DeclareLaunchArgument('num_joints',    default_value='5'),
         DeclareLaunchArgument('master_id',     default_value='0'),
         DeclareLaunchArgument('urdf_file',
             default_value='multi_motor.urdf.xacro'),

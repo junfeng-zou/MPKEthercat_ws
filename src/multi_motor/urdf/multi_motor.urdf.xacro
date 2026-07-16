@@ -7,13 +7,13 @@
   the EtherCAT hardware interface.
 
   Arguments (change on the launch command line):
-    num_joints     : number of Denali XCR drives on the bus (default 4)
+    num_joints     : number of Denali XCR drives on the bus (default 5)
     slave_config   : absolute path to ethercat_system.yaml
     master_id      : IgH master index (default 0)
 -->
 <robot name="multi_motor_system" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <xacro:arg name="num_joints"   default="4"/>
+  <xacro:arg name="num_joints"   default="5"/>
   <xacro:arg name="slave_config" default=""/>
   <xacro:arg name="master_id"    default="0"/>
 

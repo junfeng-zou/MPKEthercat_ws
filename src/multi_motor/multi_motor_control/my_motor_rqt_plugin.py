@@ -18,7 +18,7 @@ Architecture
                                  thread, talks to Qt via signals
 Topic / service summary
 -----------------------
-  /multi_motor/states_deg                (sub)  position_deg & velocity_deg_s
+  /multi_motor/states_deg                (sub)  raw/restored position, velocity
   /dynamic_joint_states                  (sub)  status_word, mode disp
   /cia402_cmd_controller/commands        (pub)  Control Word array
   /cia402_mode_controller/commands       (pub)  Mode array
@@ -27,6 +27,7 @@ Topic / service summary
   /multi_motor/csp_position_deg/commands      (pub)  position setpoint
   /multi_motor/csv_velocity_deg_s/commands    (pub)  velocity setpoint
   /multi_motor/pv_velocity_deg_s/commands     (pub)  target velocity in PV mode
+  /multi_motor/reset_encoder_restore          (pub)  reset restored encoder state
   /controller_manager/list_controllers   (srv)
   /controller_manager/switch_controller  (srv)
 """
@@ -34,6 +35,7 @@ Topic / service summary
 from __future__ import annotations
 
 import os
+import math
 import threading
 import time
 from typing import List, Optional
@@ -61,9 +63,23 @@ try:
     from multi_motor_control.cia402 import (
         CW, MODE, parse_status_word, next_control_word,
     )
+    from multi_motor_control.joint_limits import (
+        JointLimit, load_joint_limits, save_min_zero_calibration,
+        save_range_calibration, save_linear_manual_calibration,
+        DEFAULT_LINEAR_ENCODER_COUNTS_PER_REV,
+        DEFAULT_LINEAR_SCREW_LEAD_MM_PER_REV,
+        DEFAULT_LINEAR_DIRECTION,
+    )
 except ImportError:
     # Running this file directly, e.g. `python3 my_motor_rqt_plugin.py`
     from cia402 import CW, MODE, parse_status_word, next_control_word
+    from joint_limits import (
+        JointLimit, load_joint_limits, save_min_zero_calibration,
+        save_range_calibration, save_linear_manual_calibration,
+        DEFAULT_LINEAR_ENCODER_COUNTS_PER_REV,
+        DEFAULT_LINEAR_SCREW_LEAD_MM_PER_REV,
+        DEFAULT_LINEAR_DIRECTION,
+    )
 
 
 # ==========================================================
@@ -76,13 +92,16 @@ class RosBridge(QObject):
 
     Public Qt signals
     -----------------
-      joint_state_updated(list[float] pos_deg, list[float] vel_deg_s)
+      joint_state_updated(list[float] pos, list[float] vel,
+                          list[float] raw_cnt,
+                          list[float] restored_cnt,
+                          list[float] restored_pos)
       dynamic_state_updated(list[int] status_words, list[int] mode_disp)
       controllers_updated(dict[str, str] name -> state)
       log_message(str level, str msg)
     """
 
-    joint_state_updated   = pyqtSignal(list, list)
+    joint_state_updated   = pyqtSignal(list, list, list, list, list)
     dynamic_state_updated = pyqtSignal(list, list)
     controllers_updated   = pyqtSignal(dict)
     log_message           = pyqtSignal(str, str)
@@ -143,10 +162,14 @@ class RosBridge(QObject):
             Float64MultiArray, '/multi_motor/pp_position_deg/commands', 10)
         self._pub_csp  = n.create_publisher(
             Float64MultiArray, '/multi_motor/csp_position_deg/commands', 10)
+        self._pub_csp_counts = n.create_publisher(
+            Float64MultiArray, '/csp_controller/commands', 10)
         self._pub_csv  = n.create_publisher(
             Float64MultiArray, '/multi_motor/csv_velocity_deg_s/commands', 10)
         self._pub_pv   = n.create_publisher(
             Float64MultiArray, '/multi_motor/pv_velocity_deg_s/commands', 10)
+        self._pub_reset_encoder_restore = n.create_publisher(
+            Float64MultiArray, '/multi_motor/reset_encoder_restore', 10)
 
         # ---- subscribers ----
         n.create_subscription(
@@ -171,16 +194,28 @@ class RosBridge(QObject):
     def _cb_degree_state(self, msg: DynamicJointState):
         pos = [0.0] * self._num
         vel = [0.0] * self._num
+        raw_cnt = [math.nan] * self._num
+        restored_cnt = [math.nan] * self._num
+        restored_pos = [math.nan] * self._num
         for jn, ifv in zip(msg.joint_names, msg.interface_values):
             if jn not in self._joint_names:
                 continue
             i = self._joint_names.index(jn)
             for name, val in zip(ifv.interface_names, ifv.values):
-                if name == 'position_deg':
+                if name in ('position_deg', 'position_mm'):
                     pos[i] = val
-                elif name == 'velocity_deg_s':
+                elif name in ('velocity_deg_s', 'velocity_mm_s'):
                     vel[i] = val
-        self.joint_state_updated.emit(pos, vel)
+                elif name == 'raw_position_cnt':
+                    raw_cnt[i] = val
+                elif name == 'restored_position_cnt':
+                    restored_cnt[i] = val
+                elif name in ('restored_position_deg', 'restored_position_mm'):
+                    restored_pos[i] = val
+            if not math.isfinite(restored_pos[i]):
+                restored_pos[i] = pos[i]
+        self.joint_state_updated.emit(
+            pos, vel, raw_cnt, restored_cnt, restored_pos)
 
     def _cb_dynamic_state(self, msg: DynamicJointState):
         sw   = [0] * self._num
@@ -236,11 +271,17 @@ class RosBridge(QObject):
     def publish_csp(self, vec: List[float]):
         self._publish_array(self._pub_csp, vec)
 
+    def publish_csp_counts(self, vec: List[float]):
+        self._publish_array(self._pub_csp_counts, vec)
+
     def publish_csv(self, vec: List[float]):
         self._publish_array(self._pub_csv, vec)
 
     def publish_pv(self, vec: List[float]):
         self._publish_array(self._pub_pv, vec)
+
+    def publish_reset_encoder_restore(self, vec: List[float]):
+        self._publish_array(self._pub_reset_encoder_restore, vec)
 
     # ------------------------------------------------------
     # switch_controller - fire-and-forget, result logged
@@ -289,23 +330,33 @@ class MotorPanel(QGroupBox):
         ('PV  (Profile Velocity)',     MODE.PROFILE_VELOCITY),
     ]
 
-    # Slider/Spinbox 允许的位置范围，以输出轴转数为单位。
-    # 默认 ±5 圈，足够常规调试且不会一不小心把电机撞飞。
+    # Fallback range if calibrate.json is not available.
     POS_RANGE_REVS = 5
     # 速度目标范围：±5 圈/秒，可按需放宽。
     VEL_RANGE_REVS_PER_S = 5
     POS_SLIDER_SCALE = 10  # slider integer step = 0.1 deg
 
     def __init__(self, joint_name: str, index: int,
-                 encoder_resolution: float, parent=None):
+                 encoder_resolution: float,
+                 position_limit: Optional[JointLimit] = None,
+                 fallback_unit: str = 'deg',
+                 parent=None):
         super().__init__(joint_name, parent)
         self.joint_name = joint_name
         self.index = index
         self.encoder_resolution = encoder_resolution
+        self.position_limit = position_limit
+        self.position_unit = (
+            position_limit.display_unit
+            if position_limit is not None else fallback_unit)
 
         self._cached_status_word = 0
         self._cached_mode_disp   = 0
-        self._cached_pos_deg     = 0.0
+        self._cached_pos_deg = (
+            position_limit.default_deg if position_limit is not None else 0.0)
+        self._cached_raw_position_cnt = math.nan
+        self._cached_restored_position_cnt = math.nan
+        self._cached_restored_pos_deg = math.nan
         self._cached_vel_deg_s   = 0.0
 
         self._build_ui()
@@ -332,13 +383,18 @@ class MotorPanel(QGroupBox):
         s.addWidget(self.lbl_sw, row, 1)
         row += 1
 
-        s.addWidget(QLabel('Position:'), row, 0)
-        self.lbl_pos = QLabel('0.000 deg')
+        s.addWidget(QLabel('Raw Position:'), row, 0)
+        self.lbl_pos = QLabel('n/a cnt')
         s.addWidget(self.lbl_pos, row, 1)
         row += 1
 
+        s.addWidget(QLabel('Restored Position:'), row, 0)
+        self.lbl_restored_pos = QLabel(f'n/a {self.position_unit}')
+        s.addWidget(self.lbl_restored_pos, row, 1)
+        row += 1
+
         s.addWidget(QLabel('Velocity:'), row, 0)
-        self.lbl_vel = QLabel('0.000 deg/s')
+        self.lbl_vel = QLabel(f'0.000 {self.position_unit}/s')
         s.addWidget(self.lbl_vel, row, 1)
 
         gb_status = QGroupBox('Status')
@@ -363,6 +419,7 @@ class MotorPanel(QGroupBox):
         self.cmb_mode = QComboBox()
         for label, _ in self.MODES_UI:
             self.cmb_mode.addItem(label)
+        self.cmb_mode.setCurrentIndex(2)  # CSV: safe zero-velocity enable path
         mode_row.addWidget(self.cmb_mode, 1)
         self.btn_apply_mode = QPushButton('Apply')
         mode_row.addWidget(self.btn_apply_mode)
@@ -370,24 +427,29 @@ class MotorPanel(QGroupBox):
 
         # ---- CSP controls ----------------------------
         # 位置目标单位：角度。ROS 层 unit_converter 负责 deg -> counts。
-        pos_limit_deg = self.POS_RANGE_REVS * 360.0
-        pos_slider_limit = int(pos_limit_deg * self.POS_SLIDER_SCALE)
+        pos_min_deg, pos_max_deg = self._position_bounds()
+        pos_min_slider = int(round(pos_min_deg * self.POS_SLIDER_SCALE))
+        pos_max_slider = int(round(pos_max_deg * self.POS_SLIDER_SCALE))
+        pos_default_deg = self._clamp_position_deg(
+            self.feedback_position_deg())
 
-        gb_csp = QGroupBox('PP / CSP - Position setpoint (deg)')
-        csp = QVBoxLayout(gb_csp)
+        self.gb_csp = QGroupBox(
+            f'PP / CSP - Position setpoint ({self.position_unit})')
+        csp = QVBoxLayout(self.gb_csp)
         csp_row = QHBoxLayout()
         self.sld_pos = QSlider(Qt.Horizontal)
-        self.sld_pos.setRange(-pos_slider_limit, pos_slider_limit)
+        self.sld_pos.setRange(pos_min_slider, pos_max_slider)
         self.sld_pos.setSingleStep(1)
         self.sld_pos.setPageStep(10)
-        self.sld_pos.setValue(0)
+        self.sld_pos.setValue(int(round(pos_default_deg * self.POS_SLIDER_SCALE)))
         csp_row.addWidget(self.sld_pos, 1)
         self.spn_pos = QDoubleSpinBox()
         self.spn_pos.setDecimals(3)
-        self.spn_pos.setRange(-pos_limit_deg, pos_limit_deg)
+        self.spn_pos.setRange(pos_min_deg, pos_max_deg)
         self.spn_pos.setSingleStep(1.0)
-        self.spn_pos.setSuffix(' deg')
+        self.spn_pos.setSuffix(f' {self.position_unit}')
         self.spn_pos.setGroupSeparatorShown(True)
+        self.spn_pos.setValue(pos_default_deg)
         csp_row.addWidget(self.spn_pos)
         csp.addLayout(csp_row)
 
@@ -402,25 +464,35 @@ class MotorPanel(QGroupBox):
         stream_row.addWidget(self.btn_stream_start)
         stream_row.addWidget(self.btn_stream_stop)
         csp.addLayout(stream_row)
-        root.addWidget(gb_csp)
+        root.addWidget(self.gb_csp)
 
         # ---- CSV / PV controls -----------------------
-        # 速度目标单位：deg/s。ROS 层 unit_converter 负责 deg/s -> counts/s。
-        vel_limit_deg_s = self.VEL_RANGE_REVS_PER_S * 360.0
+        # 速度目标单位跟随轴类型：旋转轴 deg/s，线性轴 mm/s。
+        if self.position_unit == 'mm':
+            screw_lead = (
+                self.position_limit.screw_lead_mm_per_rev
+                if self.position_limit is not None else
+                DEFAULT_LINEAR_SCREW_LEAD_MM_PER_REV)
+            vel_limit = self.VEL_RANGE_REVS_PER_S * screw_lead
+            vel_step = 1.0
+        else:
+            vel_limit = self.VEL_RANGE_REVS_PER_S * 360.0
+            vel_step = 10.0
 
-        gb_vel = QGroupBox('CSV / PV - Velocity setpoint (deg/s)')
-        vel = QHBoxLayout(gb_vel)
+        self.gb_vel = QGroupBox(
+            f'CSV / PV - Velocity setpoint ({self.position_unit}/s)')
+        vel = QHBoxLayout(self.gb_vel)
         self.spn_vel = QDoubleSpinBox()
         self.spn_vel.setDecimals(3)
-        self.spn_vel.setRange(-vel_limit_deg_s, vel_limit_deg_s)
-        self.spn_vel.setSingleStep(10.0)
-        self.spn_vel.setSuffix(' deg/s')
+        self.spn_vel.setRange(-vel_limit, vel_limit)
+        self.spn_vel.setSingleStep(vel_step)
+        self.spn_vel.setSuffix(f' {self.position_unit}/s')
         self.spn_vel.setGroupSeparatorShown(True)
         vel.addWidget(self.spn_vel, 1)
         self.btn_send_vel = QPushButton('Send (one-shot)')
         self.btn_send_vel.setStyleSheet('background-color:#9C27B0; color:white;')
         vel.addWidget(self.btn_send_vel)
-        root.addWidget(gb_vel)
+        root.addWidget(self.gb_vel)
 
         # ---- slider/spin linkage ---------------------
         self.sld_pos.valueChanged.connect(
@@ -428,6 +500,65 @@ class MotorPanel(QGroupBox):
         self.spn_pos.valueChanged.connect(
             lambda v: self.sld_pos.setValue(
                 int(round(v * self.POS_SLIDER_SCALE))))
+
+    def _position_bounds(self) -> tuple[float, float]:
+        if self.position_limit is not None:
+            return self.position_limit.min_deg, self.position_limit.max_deg
+        span = self.POS_RANGE_REVS * 360.0
+        return -span, span
+
+    def _velocity_bounds(self) -> tuple[float, float, float]:
+        if self.position_unit == 'mm':
+            screw_lead = (
+                self.position_limit.screw_lead_mm_per_rev
+                if self.position_limit is not None else
+                DEFAULT_LINEAR_SCREW_LEAD_MM_PER_REV)
+            limit = self.VEL_RANGE_REVS_PER_S * screw_lead
+            return -limit, limit, 1.0
+        limit = self.VEL_RANGE_REVS_PER_S * 360.0
+        return -limit, limit, 10.0
+
+    def _clamp_position_deg(self, value_deg: float) -> float:
+        min_deg, max_deg = self._position_bounds()
+        return min(max(float(value_deg), min_deg), max_deg)
+
+    def set_position_setpoint_deg(self, value_deg: float) -> float:
+        target = self._clamp_position_deg(value_deg)
+        self.sld_pos.blockSignals(True)
+        self.spn_pos.blockSignals(True)
+        try:
+            self.sld_pos.setValue(int(round(target * self.POS_SLIDER_SCALE)))
+            self.spn_pos.setValue(target)
+        finally:
+            self.sld_pos.blockSignals(False)
+            self.spn_pos.blockSignals(False)
+        return target
+
+    def update_position_limit(self, position_limit: Optional[JointLimit]) -> None:
+        self.position_limit = position_limit
+        if position_limit is not None:
+            self.position_unit = position_limit.display_unit
+        pos_min_deg, pos_max_deg = self._position_bounds()
+        vel_min, vel_max, vel_step = self._velocity_bounds()
+        self.sld_pos.blockSignals(True)
+        self.spn_pos.blockSignals(True)
+        try:
+            self.sld_pos.setRange(
+                int(round(pos_min_deg * self.POS_SLIDER_SCALE)),
+                int(round(pos_max_deg * self.POS_SLIDER_SCALE)))
+            self.spn_pos.setRange(pos_min_deg, pos_max_deg)
+            self.spn_pos.setSuffix(f' {self.position_unit}')
+            self.spn_vel.setRange(vel_min, vel_max)
+            self.spn_vel.setSingleStep(vel_step)
+            self.spn_vel.setSuffix(f' {self.position_unit}/s')
+            self.gb_csp.setTitle(
+                f'PP / CSP - Position setpoint ({self.position_unit})')
+            self.gb_vel.setTitle(
+                f'CSV / PV - Velocity setpoint ({self.position_unit}/s)')
+        finally:
+            self.sld_pos.blockSignals(False)
+            self.spn_pos.blockSignals(False)
+        self.set_position_setpoint_deg(self.feedback_position_deg())
 
     # ------------------------------------------------------
     # public getters
@@ -437,11 +568,22 @@ class MotorPanel(QGroupBox):
 
     def position_setpoint_deg(self) -> float:
         """PP/CSP 目标位置，单位：deg。"""
-        return float(self.spn_pos.value())
+        return self._clamp_position_deg(self.spn_pos.value())
 
     def velocity_setpoint_deg_s(self) -> float:
         """CSV/PV 目标速度，单位：deg/s。"""
         return float(self.spn_vel.value())
+
+    def feedback_position_deg(self) -> float:
+        """Current feedback position in calibrated degree space.
+
+        Prefer restored position so GUI setpoints stay consistent with the
+        power-loss recovery model. Fall back to raw calibrated position before
+        restored feedback is available.
+        """
+        if math.isfinite(self._cached_restored_pos_deg):
+            return float(self._cached_restored_pos_deg)
+        return float(self._cached_pos_deg)
 
     # ------------------------------------------------------
     # alignment helpers
@@ -449,8 +591,8 @@ class MotorPanel(QGroupBox):
     def align_setpoint_to_feedback(self) -> float:
         """
         指令初始化对齐：把 PP/CSP 的位置 spinbox/slider 强制设置为
-        当前反馈位置 (`_cached_pos_deg`)，并把 spin/slider 的
-        允许范围动态调整为「当前位置 ± POS_RANGE_REVS 圈」。
+        当前恢复后的反馈位置；如果配置了 calibrate.json，
+        则该目标值会被限制在标定的 min_deg/max_deg 范围内。
 
         必须在以下两个时机调用：
           1. 切到 CSP 模式（Apply）后：让用户看到的滑条停在「当前点」，
@@ -460,24 +602,7 @@ class MotorPanel(QGroupBox):
 
         返回对齐后的目标值（deg）。
         """
-        cur = float(self._cached_pos_deg)
-        span = self.POS_RANGE_REVS * 360.0
-        new_min = cur - span
-        new_max = cur + span
-        new_min_slider = int(round(new_min * self.POS_SLIDER_SCALE))
-        new_max_slider = int(round(new_max * self.POS_SLIDER_SCALE))
-        # 阻止 valueChanged 在 setRange/setValue 期间产生抖动信号
-        self.sld_pos.blockSignals(True)
-        self.spn_pos.blockSignals(True)
-        try:
-            self.sld_pos.setRange(new_min_slider, new_max_slider)
-            self.spn_pos.setRange(new_min, new_max)
-            self.sld_pos.setValue(int(round(cur * self.POS_SLIDER_SCALE)))
-            self.spn_pos.setValue(cur)
-        finally:
-            self.sld_pos.blockSignals(False)
-            self.spn_pos.blockSignals(False)
-        return cur
+        return self.set_position_setpoint_deg(self.feedback_position_deg())
 
     # ------------------------------------------------------
     # public updaters (called from UI thread via MultiMotorWidget)
@@ -497,17 +622,44 @@ class MotorPanel(QGroupBox):
                                     or st.ready_to_switch_on)
         self.btn_reset_fault.setEnabled(st.fault)
 
-    def update_joint_state(self, pos_deg: float, vel_deg_s: float):
+    @staticmethod
+    def _format_count(value: float) -> str:
+        if not math.isfinite(value):
+            return 'n/a cnt'
+        return f'{int(round(value)):+d} cnt'
+
+    def _format_position(self, value: float) -> str:
+        if not math.isfinite(value):
+            return f'n/a {self.position_unit}'
+        if self.position_unit == 'mm':
+            return f'{value:+.3f} mm'
+        revs = value / 360.0
+        return f'{value:+.3f} deg   ({revs:+.3f} rev)'
+
+    def update_joint_state(
+            self,
+            pos_deg: float,
+            vel_deg_s: float,
+            raw_position_cnt: float,
+            restored_position_cnt: float,
+            restored_pos_deg: float):
         """
         /multi_motor/states_deg 由 unit_converter 从底层 counts 换算而来。
-        GUI 只显示和下发角度单位。
+        GUI 额外显示 raw cnt 和恢复后的物理位置。
         """
         self._cached_pos_deg = float(pos_deg)
+        self._cached_raw_position_cnt = float(raw_position_cnt)
+        self._cached_restored_position_cnt = float(restored_position_cnt)
+        self._cached_restored_pos_deg = float(restored_pos_deg)
         self._cached_vel_deg_s = float(vel_deg_s)
-        revs = pos_deg / 360.0
-        rps = vel_deg_s / 360.0
-        self.lbl_pos.setText(f'{pos_deg:+.3f} deg   ({revs:+.3f} rev)')
-        self.lbl_vel.setText(f'{vel_deg_s:+.3f} deg/s ({rps:+.3f} rev/s)')
+        self.lbl_pos.setText(self._format_count(self._cached_raw_position_cnt))
+        self.lbl_restored_pos.setText(
+            self._format_position(self._cached_restored_pos_deg))
+        if self.position_unit == 'mm':
+            self.lbl_vel.setText(f'{vel_deg_s:+.3f} mm/s')
+        else:
+            rps = vel_deg_s / 360.0
+            self.lbl_vel.setText(f'{vel_deg_s:+.3f} deg/s ({rps:+.3f} rev/s)')
 
     @property
     def status_word(self) -> int:
@@ -528,8 +680,9 @@ class MultiMotorWidget(QWidget):
     """
 
     # Default layout, can be overridden at construction time.
-    DEFAULT_JOINTS = ['joint_1', 'joint_2', 'joint_3', 'joint_4']
+    DEFAULT_JOINTS = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5']
     DEFAULT_ENCODER_RES = 865075.2   # 2^17 * 6.6 gearbox
+    LINEAR_AXIS_INDEX = 0
 
     # Mode -> motion-controller name
     MODE_CTRL = {
@@ -543,14 +696,20 @@ class MultiMotorWidget(QWidget):
 
     # Streaming period for CSP
     CSP_STREAM_HZ = 100
+    STAGGER_BATCH_SIZE = 1
+    STAGGER_DELAY_MS = 600
 
-    # Staggered enable: how many joints in one batch, and the delay between
-    # batches (ms). Used by _start_enable_all_staggered() so a shared / weak
-    # 24 V supply does not see all motors' inrush at the exact same moment
-    # (which on this rig drops the bus below 22 V and trips drives 3+4 with
-    # CiA 402 error 0x3280 "DC link voltage").
-    STAGGER_BATCH_SIZE = 1     # enable 1 joint at a time
-    STAGGER_DELAY_MS   = 600   # gap between batches
+    CALIBRATION_VELOCITY_DEG_S = 8.0
+    CALIBRATION_STALL_VEL_DEG_S = 1.0
+    CALIBRATION_STALL_SECONDS = 1.5
+    CALIBRATION_TARGET_LEAD_DEG = 3.0
+    CALIBRATION_FAULT_TARGET_LEAD_DEG = 0.5
+    CALIBRATION_STALL_PROGRESS_DEG = 0.2
+    CALIBRATION_MIN_RUN_SECONDS = 1.0
+    CALIBRATION_MIN_MOVEMENT_DEG = 1.0
+    CALIBRATION_NO_MOVE_ABORT_SECONDS = 3.0
+    CALIBRATION_TIMEOUT_SECONDS = 45.0
+    CALIBRATION_RANGE_TIMEOUT_SECONDS = 240.0
 
     def __init__(self,
                  joint_names: Optional[List[str]] = None,
@@ -560,12 +719,32 @@ class MultiMotorWidget(QWidget):
         self.joint_names = joint_names or self.DEFAULT_JOINTS
         self.num = len(self.joint_names)
         self.encoder_resolution = encoder_resolution
+        self.position_limits, self._limits_path = load_joint_limits()
 
         # State
         self._active_ctrl: Optional[str] = None
         self._streaming_csp = [False] * self.num
         self._csv_targets = [0.0] * self.num
         self._pv_targets = [0.0] * self.num
+        self._enable_all_timers: list[QTimer] = []
+        self._calibrating_zero = False
+        self._calibrating_range = False
+        self._calibrating_linear_axis = False
+        self._calib_start_time = 0.0
+        self._calib_stall_since: list[Optional[float]] = [None] * self.num
+        self._calib_stall_raw_at = [0.0] * self.num
+        self._calib_hit = [False] * self.num
+        self._calib_raw_max: dict[str, float] = {}
+        self._calib_raw_min: dict[str, float] = {}
+        self._calib_range_phase = ['negative'] * self.num
+        self._calib_phase_start_time = [0.0] * self.num
+        self._calib_start_raw = [0.0] * self.num
+        self._calib_target_raw = [0.0] * self.num
+        self._calib_last_tick = 0.0
+        self._calib_indices: list[int] = []
+        self._linear_calib_min_cnt = math.nan
+        self._linear_calib_max_cnt = math.nan
+        self._linear_calib_last_log_time = 0.0
 
         # ROS bridge
         self.bridge = RosBridge(self.joint_names)
@@ -576,11 +755,20 @@ class MultiMotorWidget(QWidget):
 
         # UI
         self._build_ui()
+        if self._limits_path is not None:
+            self._log(f'Loaded joint limits from {self._limits_path}')
+        else:
+            self._log('No calibrate.json found; using fallback position range.',
+                      'warn')
 
         # CSP streaming timer
         self._csp_timer = QTimer(self)
         self._csp_timer.setInterval(int(1000 / self.CSP_STREAM_HZ))
         self._csp_timer.timeout.connect(self._tick_csp_stream)
+
+        self._calib_timer = QTimer(self)
+        self._calib_timer.setInterval(50)
+        self._calib_timer.timeout.connect(self._tick_calibration)
 
         # Enable-sequence timer (CiA 402 3-step walk)
         self._enable_timers: dict[int, QTimer] = {}
@@ -598,29 +786,60 @@ class MultiMotorWidget(QWidget):
         root = QVBoxLayout(self)
         root.addWidget(QLabel('<h2>Denali XCR Multi-Motor Control</h2>'))
 
-        # Global toolbar (staggered enable / disable all)
+        # Calibration toolbar
         bar = QHBoxLayout()
-        self.btn_enable_all = QPushButton(
-            f'Enable All  (staggered: {self.STAGGER_BATCH_SIZE} per '
-            f'{self.STAGGER_DELAY_MS} ms)')
+        self.btn_enable_all = QPushButton('Enable All')
         self.btn_enable_all.setStyleSheet(
             'background:#2E7D32; color:white; font-weight:bold; padding:6px;')
         self.btn_disable_all = QPushButton('Disable All')
         self.btn_disable_all.setStyleSheet(
             'background:#C62828; color:white; font-weight:bold; padding:6px;')
+        self.btn_calibrate_linear = QPushButton('Calibrate Linear M1')
+        self.btn_calibrate_linear.setStyleSheet(
+            'background:#5D4037; color:white; font-weight:bold; padding:6px;')
+        self.btn_calibrate_zero = QPushButton('Calibrate Rotary Zero M2-M5')
+        self.btn_calibrate_zero.setStyleSheet(
+            'background:#00695C; color:white; font-weight:bold; padding:6px;')
+        self.btn_calibrate_range = QPushButton('Calibrate Rotary Range M2-M5')
+        self.btn_calibrate_range.setStyleSheet(
+            'background:#0277BD; color:white; font-weight:bold; padding:6px;')
+        self.btn_go_default = QPushButton('Go Default')
+        self.btn_go_default.setStyleSheet(
+            'background:#455A64; color:white; font-weight:bold; padding:6px;')
+        self.btn_stop_calibrate = QPushButton('Stop Calibrate')
+        self.btn_stop_calibrate.setEnabled(False)
+        self.btn_stop_calibrate.setStyleSheet(
+            'background:#6D4C41; color:white; font-weight:bold; padding:6px;')
         bar.addWidget(self.btn_enable_all)
         bar.addWidget(self.btn_disable_all)
+        bar.addWidget(self.btn_calibrate_linear)
+        bar.addWidget(self.btn_calibrate_zero)
+        bar.addWidget(self.btn_calibrate_range)
+        bar.addWidget(self.btn_go_default)
+        bar.addWidget(self.btn_stop_calibrate)
         bar.addStretch(1)
         root.addLayout(bar)
-        self.btn_enable_all.clicked.connect(self._start_enable_all_staggered)
-        self.btn_disable_all.clicked.connect(self._disable_all)
+        self.btn_enable_all.clicked.connect(
+            lambda: self._start_enable_all_staggered())
+        self.btn_disable_all.clicked.connect(lambda: self._disable_all())
+        self.btn_calibrate_linear.clicked.connect(
+            self._toggle_linear_axis_calibration)
+        self.btn_calibrate_zero.clicked.connect(self._start_min_zero_calibration)
+        self.btn_calibrate_range.clicked.connect(
+            self._start_range_calibration)
+        self.btn_go_default.clicked.connect(lambda: self._go_default())
+        self.btn_stop_calibrate.clicked.connect(
+            lambda: self._stop_calibration())
 
         # Panel grid (scrollable so 3->8 motors still fits)
         grid_host = QWidget()
         grid = QGridLayout(grid_host)
         self.panels: List[MotorPanel] = []
         for i, jn in enumerate(self.joint_names):
-            p = MotorPanel(jn, i, self.encoder_resolution)
+            p = MotorPanel(
+                jn, i, self.encoder_resolution,
+                position_limit=self.position_limits.get(jn),
+                fallback_unit=self._default_unit_for_index(i))
             p.btn_enable.clicked.connect(
                 lambda _, idx=i: self._start_enable_sequence(idx))
             p.btn_disable.clicked.connect(
@@ -666,10 +885,11 @@ class MultiMotorWidget(QWidget):
     # ======================================================
     # Subscription -> UI
     # ======================================================
-    @pyqtSlot(list, list)
-    def _on_joint_state(self, pos, vel):
+    @pyqtSlot(list, list, list, list, list)
+    def _on_joint_state(self, pos, vel, raw_cnt, restored_cnt, restored_pos):
         for i, p in enumerate(self.panels):
-            p.update_joint_state(pos[i], vel[i])
+            p.update_joint_state(
+                pos[i], vel[i], raw_cnt[i], restored_cnt[i], restored_pos[i])
 
     @pyqtSlot(list, list)
     def _on_dynamic_state(self, sw, mode):
@@ -691,6 +911,266 @@ class MultiMotorWidget(QWidget):
     # ======================================================
     # Action handlers
     # ======================================================
+
+    def _linear_axis_index(self) -> Optional[int]:
+        if 0 <= self.LINEAR_AXIS_INDEX < self.num:
+            return self.LINEAR_AXIS_INDEX
+        return None
+
+    def _rotary_motor_indices(self) -> list[int]:
+        linear_idx = self._linear_axis_index()
+        return [i for i in range(self.num) if i != linear_idx]
+
+    def _default_unit_for_index(self, idx: int) -> str:
+        return 'mm' if idx == self.LINEAR_AXIS_INDEX else 'deg'
+
+    def _panel_unit(self, idx: int) -> str:
+        return self.panels[idx].position_unit
+
+    def _format_panel_value(self, idx: int, value: float) -> str:
+        unit = self._panel_unit(idx)
+        return f'{value:+.3f} {unit}'
+
+    def _clamp_position(self, joint_name: str, value_deg: float) -> float:
+        limit = self.position_limits.get(joint_name)
+        if limit is None:
+            return float(value_deg)
+        return limit.clamp(value_deg)
+
+    def _clamp_position_vector(self, vec: List[float]) -> List[float]:
+        return [
+            self._clamp_position(joint_name, value)
+            for joint_name, value in zip(self.joint_names, vec)
+        ]
+
+    def _feedback_position_vector(self) -> List[float]:
+        return self._clamp_position_vector([
+            panel.feedback_position_deg() for panel in self.panels
+        ])
+
+    def _raw_position_from_feedback(self, idx: int) -> float:
+        joint_name = self.joint_names[idx]
+        limit = self.position_limits.get(joint_name)
+        if limit is not None and limit.is_linear:
+            raw_count = float(self.panels[idx]._cached_raw_position_cnt)
+            return raw_count if math.isfinite(raw_count) else 0.0
+        pos = float(self.panels[idx]._cached_pos_deg)
+        if limit is None:
+            return pos
+        return limit.calibrated_to_raw(pos)
+
+    def _rotary_encoder_resolution(self, joint_name: str) -> float:
+        limit = self.position_limits.get(joint_name)
+        if limit is not None and not limit.is_linear:
+            return limit.encoder_resolution
+        return self.encoder_resolution
+
+    def _raw_deg_to_counts(
+            self, value_deg: float, joint_name: Optional[str] = None) -> float:
+        resolution = (
+            self._rotary_encoder_resolution(joint_name)
+            if joint_name is not None else self.encoder_resolution)
+        counts = int(round(float(value_deg) * resolution / 360.0))
+        return float(counts)
+
+    def _raw_position_counts_vector(self, raw_vec: List[float]) -> List[float]:
+        counts: List[float] = []
+        for i, value in enumerate(raw_vec):
+            limit = self.position_limits.get(self.joint_names[i])
+            if limit is not None and limit.is_linear:
+                counts.append(float(value))
+            else:
+                counts.append(self._raw_deg_to_counts(
+                    value, self.joint_names[i]))
+        return counts
+
+    def _current_drive_counts_vector(self) -> Optional[List[float]]:
+        counts: List[float] = []
+        for panel in self.panels:
+            raw_count = float(panel._cached_raw_position_cnt)
+            if not math.isfinite(raw_count):
+                self._log(
+                    'Current raw encoder feedback is not ready; cannot build '
+                    'a safe hold-position command.',
+                    'warn')
+                return None
+            counts.append(raw_count)
+        return counts
+
+    def _drive_count_for_restored_position(
+            self, idx: int, target_value: float) -> Optional[float]:
+        panel = self.panels[idx]
+        raw_count = float(panel._cached_raw_position_cnt)
+        restored_count = float(panel._cached_restored_position_cnt)
+        if not math.isfinite(raw_count) or not math.isfinite(restored_count):
+            self._log(
+                f'{self.joint_names[idx]}: restored encoder feedback is not '
+                'ready; cannot convert default pose safely.',
+                'warn')
+            return None
+
+        limit = self.position_limits.get(self.joint_names[idx])
+        if limit is None:
+            restored_target = int(round(
+                float(target_value) *
+                self._rotary_encoder_resolution(self.joint_names[idx]) /
+                360.0))
+        else:
+            restored_target = int(round(
+                limit.calibrated_to_raw_counts(
+                    target_value, self.encoder_resolution)))
+        restore_offset = restored_count - raw_count
+        return float(restored_target - restore_offset)
+
+    def _switch_motion_controller(self, target_ctrl: str) -> None:
+        self.bridge.switch_controller(
+            activate=[target_ctrl],
+            deactivate=[c for c in self.ALL_MOTION_CTRLS if c != target_ctrl],
+            strictness=SwitchController.Request.BEST_EFFORT,
+        )
+        self._active_ctrl = target_ctrl
+
+    def _reload_position_limits_for_gui(self) -> None:
+        self.position_limits, self._limits_path = load_joint_limits()
+        for panel in self.panels:
+            panel.update_position_limit(
+                self.position_limits.get(panel.joint_name))
+
+    def _stop_csp_streaming_controls(self) -> None:
+        self._csp_timer.stop()
+        self._streaming_csp = [False] * self.num
+        for panel in self.panels:
+            panel.btn_stream_start.setEnabled(True)
+            panel.btn_stream_stop.setEnabled(False)
+
+    def _cancel_enable_all_timers(self) -> None:
+        for timer in self._enable_all_timers:
+            timer.stop()
+        self._enable_all_timers.clear()
+
+    def _start_enable_all_staggered(self) -> None:
+        if (self._calibrating_zero or self._calibrating_range or
+                self._calibrating_linear_axis):
+            self._log('Enable All: stop calibration first.', 'warn')
+            return
+
+        self._cancel_enable_all_timers()
+        pending: list[int] = []
+        faulted: list[str] = []
+        already_enabled: list[str] = []
+        for i, panel in enumerate(self.panels):
+            st = parse_status_word(panel.status_word)
+            if st.fault:
+                faulted.append(self.joint_names[i])
+            elif st.operation_enabled:
+                already_enabled.append(self.joint_names[i])
+            else:
+                pending.append(i)
+
+        if faulted:
+            self._log(
+                f'Enable All: skip faulted joints; reset them first: {faulted}',
+                'warn')
+        if already_enabled:
+            self._log(
+                f'Enable All: already enabled: {already_enabled}')
+        if not pending:
+            self._log('Enable All: no joints need enabling.')
+            return
+
+        self._log(
+            f'Enable All: enabling {len(pending)} joints, '
+            f'{self.STAGGER_BATCH_SIZE} per {self.STAGGER_DELAY_MS} ms.')
+        batches = [
+            pending[i:i + self.STAGGER_BATCH_SIZE]
+            for i in range(0, len(pending), self.STAGGER_BATCH_SIZE)
+        ]
+        for batch_index, batch in enumerate(batches):
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+
+            def _run_batch(batch=batch, timer=timer):
+                if timer in self._enable_all_timers:
+                    self._enable_all_timers.remove(timer)
+                for idx in batch:
+                    self._start_enable_sequence(idx)
+
+            timer.timeout.connect(_run_batch)
+            self._enable_all_timers.append(timer)
+            timer.start(batch_index * self.STAGGER_DELAY_MS)
+
+    def _disable_all(self) -> None:
+        if (self._calibrating_zero or self._calibrating_range or
+                self._calibrating_linear_axis):
+            self._stop_calibration(reason='disabled')
+        self._cancel_enable_all_timers()
+        for timer in self._enable_timers.values():
+            timer.stop()
+        self._enable_timers.clear()
+        self._stop_csp_streaming_controls()
+        self.bridge.publish_csv([0.0] * self.num)
+        self.bridge.publish_pv([0.0] * self.num)
+        self._csv_targets = [0.0] * self.num
+        self._pv_targets = [0.0] * self.num
+        self.bridge.publish_control_word(
+            [float(CW.DISABLE_VOLTAGE)] * self.num)
+        self._log('Disable All: sent Disable Voltage to every joint.', 'warn')
+
+    def _default_position_vector(
+            self, indices: Optional[list[int]] = None) -> List[float]:
+        defaults = self._feedback_position_vector()
+        target_indices = range(self.num) if indices is None else indices
+        for i in target_indices:
+            joint_name = self.joint_names[i]
+            limit = self.position_limits.get(joint_name)
+            defaults[i] = limit.default_deg if limit is not None else 0.0
+        return self._clamp_position_vector(defaults)
+
+    def _go_default(self) -> None:
+        if (self._calibrating_zero or self._calibrating_range or
+                self._calibrating_linear_axis):
+            self._log('Go Default: stop calibration first.', 'warn')
+            return
+        target_indices = self._rotary_motor_indices()
+        if self._enabled_calibration_not_ready('Go Default', target_indices):
+            return
+
+        self._reload_position_limits_for_gui()
+        default_vec = self._default_position_vector(target_indices)
+        current_counts = self._current_drive_counts_vector()
+        if current_counts is None:
+            return
+        default_counts = list(current_counts)
+        for idx in target_indices:
+            target_count = self._drive_count_for_restored_position(
+                idx, default_vec[idx])
+            if target_count is None:
+                return
+            default_counts[idx] = target_count
+
+        self._stop_csp_streaming_controls()
+        for idx in target_indices:
+            self.panels[idx].set_position_setpoint_deg(default_vec[idx])
+
+        self.bridge.publish_csv([0.0] * self.num)
+        self.bridge.publish_pv([0.0] * self.num)
+        self.bridge.publish_csp_counts(current_counts)
+        self._switch_motion_controller('csp_controller')
+
+        def _publish_default():
+            self.bridge.publish_csp_counts(default_counts)
+            mvec = [float(p.mode_display or MODE.NO_MODE)
+                    for p in self.panels]
+            for idx in target_indices:
+                mvec[idx] = float(MODE.CSP)
+            self.bridge.publish_mode(mvec)
+            self._log(
+                'Go Default: M2-M5 CSP targets -> '
+                f'{[self._format_panel_value(i, default_vec[i]) for i in target_indices]}.')
+
+        QTimer.singleShot(250, _publish_default)
+        QTimer.singleShot(
+            400, lambda: self.bridge.publish_csp_counts(default_counts))
 
     # ---- Enable (direct mode) ----
     def _start_enable_sequence(self, idx: int):
@@ -721,8 +1201,19 @@ class MultiMotorWidget(QWidget):
             f'{self.joint_names[idx]}: enable sequence start '
             f'(target={MODE.NAMES.get(user_mode, user_mode)})')
 
-        # CSP 使用 CSV 引导；其他模式直接使能
-        enable_mode = MODE.CSV if user_mode == MODE.CSP else user_mode
+        # Position modes use CSV as a zero-velocity enable path. This keeps
+        # stale 0x607A targets out of the CiA 402 enable transition.
+        enable_mode = (
+            MODE.CSV if user_mode in (MODE.PROFILE_POSITION, MODE.CSP)
+            else user_mode)
+
+        if enable_mode == MODE.CSV:
+            self._csv_targets = [0.0] * self.num
+            self.bridge.publish_csv(self._csv_targets)
+            self._switch_motion_controller('csv_controller')
+            self._log(
+                f'{self.joint_names[idx]}: CSV controller active with '
+                'zero velocity before CiA 402 switch-on')
 
         # ---- Step 1: 注入使能模式 ----
         mvec = [float(p.mode_display or MODE.NO_MODE) for p in self.panels]
@@ -737,7 +1228,8 @@ class MultiMotorWidget(QWidget):
             cur = self.panels[idx].align_setpoint_to_feedback()
             self._log(
                 f'{self.joint_names[idx]}: position setpoint '
-                f'aligned to feedback @ {cur:+.3f} deg')
+                f'aligned to feedback @ '
+                f'{self._format_panel_value(idx, cur)}')
 
         # ---- Step 3+4: 延迟 300 ms 等 mode 生效，再走状态机 ----
         QTimer.singleShot(
@@ -814,34 +1306,52 @@ class MultiMotorWidget(QWidget):
             return
 
         # ---- Step 1: 激活 controller（此时仍在安全模式） ----
-        to_deact = [c for c in self.ALL_MOTION_CTRLS
-                    if c != target_ctrl and c == self._active_ctrl]
-        self.bridge.switch_controller(
-            activate=[target_ctrl],
-            deactivate=to_deact,
-            strictness=SwitchController.Request.BEST_EFFORT,
-        )
-        self._active_ctrl = target_ctrl
+        self._switch_motion_controller(target_ctrl)
         self._log(
             f'{self.joint_names[idx]}: activated {target_ctrl}')
 
         # ---- Step 2: CSP 模式特殊处理 ----
+        if target_mode == MODE.PROFILE_POSITION:
+            cur = self.panels[idx].align_setpoint_to_feedback()
+
+            def _publish_and_switch_pp():
+                pos_vec = self._feedback_position_vector()
+                self.bridge.publish_pp(pos_vec)
+                self._log(
+                    f'{self.joint_names[idx]}: PP position = '
+                    f'{self._format_panel_value(idx, cur)}, waiting for CI '
+                    'to stabilize...')
+
+                def _inject_pp_mode():
+                    fresh_pos = self._feedback_position_vector()
+                    self.bridge.publish_pp(fresh_pos)
+                    mvec = [float(p.mode_display or MODE.NO_MODE)
+                            for p in self.panels]
+                    mvec[idx] = float(MODE.PROFILE_POSITION)
+                    self.bridge.publish_mode(mvec)
+                    self._log(
+                        f'{self.joint_names[idx]}: PP mode injected safely')
+
+                QTimer.singleShot(200, _inject_pp_mode)
+
+            QTimer.singleShot(50, _publish_and_switch_pp)
+
         if target_mode == MODE.CSP:
             # 发送当前反馈位置，覆盖 command_interface 中可能的陈旧值
             cur = self.panels[idx].align_setpoint_to_feedback()
-            cur_pos_vec = [float(p._cached_pos_deg) for p in self.panels]
+            cur_pos_vec = self._feedback_position_vector()
 
             def _publish_and_switch():
                 # 连续发送位置确保 controller 收到
                 self.bridge.publish_csp(cur_pos_vec)
                 self._log(
                     f'{self.joint_names[idx]}: CSP position = '
-                    f'{cur:+.3f} deg, waiting for CI to stabilize...')
+                    f'{self._format_panel_value(idx, cur)}, waiting for CI '
+                    'to stabilize...')
 
                 def _inject_csp_mode():
                     # 再发一次位置确保万无一失
-                    fresh_pos = [float(p._cached_pos_deg)
-                                 for p in self.panels]
+                    fresh_pos = self._feedback_position_vector()
                     self.bridge.publish_csp(fresh_pos)
                     # 现在注入 CSP 模式
                     mvec = [float(p.mode_display or MODE.NO_MODE)
@@ -859,6 +1369,9 @@ class MultiMotorWidget(QWidget):
             QTimer.singleShot(50, _publish_and_switch)
 
     def _on_disable(self, idx: int):
+        if (self._calibrating_zero or self._calibrating_range or
+                self._calibrating_linear_axis):
+            self._stop_calibration(reason='disabled')
         self._log(f'{self.joint_names[idx]}: disable')
         t = self._enable_timers.pop(idx, None)
         if t is not None:
@@ -867,64 +1380,690 @@ class MultiMotorWidget(QWidget):
         vec[idx] = float(CW.DISABLE_VOLTAGE)
         self.bridge.publish_control_word(vec)
 
-    # ------------------------------------------------------
-    # Staggered (batched) enable / disable for all joints
-    # ------------------------------------------------------
-    def _start_enable_all_staggered(self):
-        """
-        Enable all joints in batches of STAGGER_BATCH_SIZE separated by
-        STAGGER_DELAY_MS. This prevents simultaneous inrush on a shared
-        24 V supply, which on this rig was sagging the DC link below the
-        drive's UV threshold (CiA 402 error 0x3280) and tripping the
-        last motors in the daisy-chain (typically joint_3 / joint_4).
+    def _tick_calibration(self):
+        if self._calibrating_zero:
+            self._tick_zero_calibration()
+        elif self._calibrating_range:
+            self._tick_range_calibration()
+        elif self._calibrating_linear_axis:
+            self._tick_linear_axis_calibration()
 
-        Joints that are already in fault are skipped here -- the user
-        should hit "Reset Fault" first; otherwise we only fight ourselves.
-        """
-        batch_sz = max(1, int(self.STAGGER_BATCH_SIZE))
-        delay_ms = max(0, int(self.STAGGER_DELAY_MS))
+    def _stop_calibration(self, reason: str = 'stopped'):
+        if self._calibrating_zero:
+            self._finish_zero_calibration(save=False, reason=reason)
+        elif self._calibrating_range:
+            self._finish_range_calibration(save=False, reason=reason)
+        elif self._calibrating_linear_axis:
+            self._finish_linear_axis_calibration(save=False, reason=reason)
 
-        targets: list[int] = []
-        for i, p in enumerate(self.panels):
+    def _enabled_calibration_not_ready(
+            self, label: str,
+            indices: Optional[list[int]] = None) -> list[str]:
+        not_ready = []
+        target_indices = range(self.num) if indices is None else indices
+        for i in target_indices:
+            p = self.panels[i]
             st = parse_status_word(p.status_word)
-            if st.fault:
-                self._log(
-                    f'{self.joint_names[i]}: skipped by Enable All '
-                    f'(in FAULT, reset first)', 'warn')
-                continue
-            if st.operation_enabled:
-                continue   # already on, nothing to do
-            targets.append(i)
+            if not st.operation_enabled:
+                not_ready.append(self.joint_names[i])
+        if not_ready:
+            self._log(
+                f'{label}: enable each joint first: {not_ready}', 'warn')
+        return not_ready
 
-        if not targets:
-            self._log('Enable All: nothing to do (all enabled or faulted)')
+    def _enter_raw_csp_calibration(self, label: str) -> None:
+        self._csp_timer.stop()
+        self._streaming_csp = [False] * self.num
+        for p in self.panels:
+            p.btn_stream_start.setEnabled(True)
+            p.btn_stream_stop.setEnabled(False)
+
+        self.bridge.publish_csv([0.0] * self.num)
+        self.bridge.publish_pv([0.0] * self.num)
+        self.bridge.publish_csp_counts(
+            self._raw_position_counts_vector(self._calib_target_raw))
+        self._switch_motion_controller('csp_controller')
+        self._log(
+            f'{label}: using CSP raw-position commands; stop immediately if '
+            'the mechanism binds unexpectedly.', 'warn')
+
+    def _set_calibration_buttons_active(self, active: bool) -> None:
+        self.btn_enable_all.setEnabled(not active)
+        self.btn_calibrate_zero.setEnabled(not active)
+        self.btn_calibrate_range.setEnabled(not active)
+        self.btn_calibrate_linear.setEnabled(
+            not active or self._calibrating_linear_axis)
+        self.btn_go_default.setEnabled(not active)
+        self.btn_stop_calibrate.setEnabled(active)
+
+    # ---- Manual linear-axis calibration ----------------------
+    def _linear_axis_scale(self) -> tuple[float, float, float]:
+        idx = self._linear_axis_index()
+        limit = (
+            self.position_limits.get(self.joint_names[idx])
+            if idx is not None else None)
+        if limit is not None and limit.is_linear:
+            return (
+                limit.encoder_counts_per_rev,
+                limit.screw_lead_mm_per_rev,
+                limit.linear_direction,
+            )
+        return (
+            DEFAULT_LINEAR_ENCODER_COUNTS_PER_REV,
+            DEFAULT_LINEAR_SCREW_LEAD_MM_PER_REV,
+            DEFAULT_LINEAR_DIRECTION,
+        )
+
+    def _linear_axis_feedback_count(self) -> float:
+        idx = self._linear_axis_index()
+        if idx is None:
+            return math.nan
+        panel = self.panels[idx]
+        if math.isfinite(panel._cached_restored_position_cnt):
+            return float(panel._cached_restored_position_cnt)
+        return float(panel._cached_raw_position_cnt)
+
+    def _linear_axis_range_mm(self) -> float:
+        encoder_counts_per_rev, screw_lead_mm_per_rev, _ = (
+            self._linear_axis_scale())
+        if (
+            not math.isfinite(self._linear_calib_min_cnt) or
+            not math.isfinite(self._linear_calib_max_cnt)
+        ):
+            return math.nan
+        return (
+            abs(self._linear_calib_max_cnt - self._linear_calib_min_cnt) *
+            screw_lead_mm_per_rev / encoder_counts_per_rev
+        )
+
+    def _linear_axis_zero_count(self) -> float:
+        _, _, linear_direction = self._linear_axis_scale()
+        if linear_direction < 0.0:
+            return self._linear_calib_max_cnt
+        return self._linear_calib_min_cnt
+
+    def _toggle_linear_axis_calibration(self):
+        if self._calibrating_linear_axis:
+            self._finish_linear_axis_calibration(save=True, reason='saved')
+        else:
+            self._start_linear_axis_calibration()
+
+    def _start_linear_axis_calibration(self):
+        if (self._calibrating_zero or self._calibrating_range or
+                self._calibrating_linear_axis):
+            return
+        if self._limits_path is None:
+            self._log('Linear M1 calibration: no calibrate.json path found.',
+                      'error')
+            return
+        idx = self._linear_axis_index()
+        if idx is None:
+            self._log('Linear M1 calibration: joint_1 is not available.',
+                      'error')
+            return
+
+        count = self._linear_axis_feedback_count()
+        if not math.isfinite(count):
+            self._log(
+                'Linear M1 calibration: waiting for encoder feedback first.',
+                'warn')
+            return
+
+        self._calibrating_linear_axis = True
+        self._calib_start_time = time.monotonic()
+        self._calib_last_tick = self._calib_start_time
+        self._linear_calib_min_cnt = count
+        self._linear_calib_max_cnt = count
+        self._linear_calib_last_log_time = 0.0
+        self.btn_calibrate_linear.setText('Save Linear M1')
+        self._set_calibration_buttons_active(True)
+        self._calib_timer.start()
+        self._log(
+            'Linear M1 calibration: recording encoder range only; move M1 '
+            'manually to both ends, then click "Save Linear M1".',
+            'warn')
+
+    def _tick_linear_axis_calibration(self):
+        if not self._calibrating_linear_axis:
+            return
+        count = self._linear_axis_feedback_count()
+        if not math.isfinite(count):
+            return
+        self._linear_calib_min_cnt = min(self._linear_calib_min_cnt, count)
+        self._linear_calib_max_cnt = max(self._linear_calib_max_cnt, count)
+
+        now = time.monotonic()
+        if now - self._linear_calib_last_log_time < 1.0:
+            return
+        self._linear_calib_last_log_time = now
+        self._log(
+            'Linear M1 calibration: observed count range '
+            f'[{self._linear_calib_min_cnt:.0f}, '
+            f'{self._linear_calib_max_cnt:.0f}] -> '
+            f'{self._linear_axis_range_mm():.3f} mm.')
+
+    def _finish_linear_axis_calibration(self, save: bool, reason: str):
+        if not self._calibrating_linear_axis:
+            return
+        if save:
+            range_mm = self._linear_axis_range_mm()
+            if not math.isfinite(range_mm) or range_mm <= 0.0:
+                self._log(
+                    'Linear M1 calibration: move the axis through a '
+                    'non-zero range before saving.',
+                    'warn')
+                return
+
+            idx = self._linear_axis_index()
+            joint_name = self.joint_names[idx]
+            encoder_counts_per_rev, screw_lead_mm_per_rev, linear_direction = (
+                self._linear_axis_scale())
+            zero_count = self._linear_axis_zero_count()
+            try:
+                save_linear_manual_calibration(
+                    self._limits_path,
+                    joint_name,
+                    zero_count,
+                    range_mm,
+                    encoder_counts_per_rev=encoder_counts_per_rev,
+                    screw_lead_mm_per_rev=screw_lead_mm_per_rev,
+                    linear_direction=linear_direction)
+                self.position_limits, self._limits_path = load_joint_limits()
+                self.panels[idx].update_position_limit(
+                    self.position_limits.get(joint_name))
+                self.panels[idx].set_position_setpoint_deg(0.0)
+            except Exception as exc:                 # noqa: BLE001
+                self._log(
+                    f'Linear M1 calibration: failed to save {joint_name}: '
+                    f'{exc}',
+                    'error')
+                return
+
+            self._log(
+                f'Linear M1 calibration: saved 0..{range_mm:.3f} mm '
+                f'to {self._limits_path}; zero_count={zero_count:.0f}.')
+        else:
+            self._log(
+                f'Linear M1 calibration: {reason}; no changes saved.',
+                'warn')
+
+        self._calib_timer.stop()
+        self._calibrating_linear_axis = False
+        self.btn_calibrate_linear.setText('Calibrate Linear M1')
+        self._set_calibration_buttons_active(False)
+
+    # ---- Initial zero calibration ----------------------
+    def _start_min_zero_calibration(self):
+        """
+        Slowly move every enabled joint in the negative direction until its
+        feedback velocity stalls, then write that raw minimum as calibrated
+        zero.
+
+        Stall-based homing is only an inference. A physical limit switch,
+        drive torque/current threshold, or CiA 402 homing mode is safer.
+        """
+        if (self._calibrating_zero or self._calibrating_range or
+                self._calibrating_linear_axis):
+            return
+        if self._limits_path is None:
+            self._log(
+                'Rotary Zero M2-M5: no calibrate.json path found.', 'error')
+            return
+
+        target_indices = self._rotary_motor_indices()
+        if self._enabled_calibration_not_ready(
+                'Rotary Zero M2-M5', target_indices):
+            return
+
+        self._calibrating_zero = True
+        self._calib_indices = target_indices
+        self._calib_start_time = time.monotonic()
+        self._calib_last_tick = self._calib_start_time
+        self._calib_stall_since = [None] * self.num
+        self._calib_stall_raw_at = [0.0] * self.num
+        self._calib_hit = [i not in target_indices for i in range(self.num)]
+        self._calib_raw_min = {}
+        self._calib_raw_max = {}
+        self._calib_start_raw = [
+            self._raw_position_from_feedback(i) for i in range(self.num)]
+        self._calib_target_raw = list(self._calib_start_raw)
+
+        # CSP calibration bypasses the degree API because the unhomed
+        # calibrated range may already be clamped.
+        self._enter_raw_csp_calibration('Rotary Zero M2-M5')
+
+        self._log(
+            'Rotary Zero M2-M5: moving M2-M5 negative slowly.', 'warn')
+
+        def _inject_csp_and_start():
+            if not self._calibrating_zero:
+                return
+            self.bridge.publish_csp_counts(
+                self._raw_position_counts_vector(self._calib_target_raw))
+            mvec = [float(p.mode_display or MODE.NO_MODE)
+                    for p in self.panels]
+            for idx in target_indices:
+                mvec[idx] = float(MODE.CSP)
+            self.bridge.publish_mode(mvec)
+            self._set_calibration_buttons_active(True)
+            self._calib_last_tick = time.monotonic()
+            self._calib_timer.start()
+
+        QTimer.singleShot(300, _inject_csp_and_start)
+
+    def _complete_joint_zero_calibration(
+            self, idx: int, raw_min: float, detail: str) -> bool:
+        joint_name = self.joint_names[idx]
+        if self._calib_hit[idx]:
+            return True
+
+        self._calib_hit[idx] = True
+        self._calib_raw_min[joint_name] = raw_min
+        self._calib_target_raw[idx] = raw_min
+
+        try:
+            save_min_zero_calibration(
+                self._limits_path, [joint_name], {joint_name: raw_min})
+            self.position_limits, self._limits_path = load_joint_limits()
+            self.panels[idx].update_position_limit(
+                self.position_limits.get(joint_name))
+            self.panels[idx].set_position_setpoint_deg(0.0)
+            reset_vec = [math.nan] * self.num
+            reset_vec[idx] = self._raw_deg_to_counts(raw_min, joint_name)
+            self.bridge.publish_reset_encoder_restore(reset_vec)
+        except Exception as exc:                     # noqa: BLE001
+            self._log(
+                f'Rotary Zero M2-M5: failed to save {joint_name}: {exc}',
+                'error')
+            self._finish_zero_calibration(save=False, reason='save failed')
+            return False
+
+        self._log(
+            f'Rotary Zero M2-M5: {joint_name} saved min zero at '
+            f'raw={raw_min:+.3f} deg ({detail}); remaining='
+            f'{[self.joint_names[i] for i in self._calib_indices if not self._calib_hit[i]]}')
+        return True
+
+    def _tick_zero_calibration(self):
+        if not self._calibrating_zero:
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._calib_start_time
+        if elapsed > self.CALIBRATION_TIMEOUT_SECONDS:
+            self._finish_zero_calibration(save=False, reason='timeout')
+            return
+
+        dt = max(0.0, min(now - self._calib_last_tick, 0.2))
+        self._calib_last_tick = now
+        any_moved_negative = False
+        for i, p in enumerate(self.panels):
+            if i not in self._calib_indices:
+                continue
+            if self._calib_hit[i]:
+                any_moved_negative = True
+                continue
+
+            st = parse_status_word(p.status_word)
+            raw_pos = self._raw_position_from_feedback(i)
+            moved = self._calib_start_raw[i] - raw_pos
+            target_lead = raw_pos - self._calib_target_raw[i]
+            moved_negative = moved > 0.0
+            any_moved_negative = any_moved_negative or moved_negative
+
+            if st.fault:
+                limit_like_fault = (
+                    target_lead >= self.CALIBRATION_FAULT_TARGET_LEAD_DEG and
+                    abs(float(p._cached_vel_deg_s)) <=
+                    self.CALIBRATION_STALL_VEL_DEG_S)
+                if limit_like_fault:
+                    self._log(
+                        f'Rotary Zero M2-M5: {self.joint_names[i]} faulted at '
+                        f'near-zero velocity; treating as min limit. '
+                        f'sw=0x{p.status_word:04X}, raw={raw_pos:+.3f} deg, '
+                        f'moved={moved:+.3f} deg, '
+                        f'lead={target_lead:+.3f} deg, '
+                        f'vel={p._cached_vel_deg_s:+.3f} deg/s.',
+                        'warn')
+                    if not self._complete_joint_zero_calibration(
+                            i, raw_pos, 'fault near limit'):
+                        return
+                    continue
+
+                self._log(
+                    f'Rotary Zero M2-M5: {self.joint_names[i]} faulted; abort. '
+                    f'sw=0x{p.status_word:04X}, raw={raw_pos:+.3f} deg, '
+                    f'moved={moved:+.3f} deg, '
+                    f'lead={target_lead:+.3f} deg, '
+                    f'vel={p._cached_vel_deg_s:+.3f} deg/s.',
+                    'error')
+                self._finish_zero_calibration(save=False, reason='fault')
+                return
+
+            target_is_ahead = target_lead >= self.CALIBRATION_TARGET_LEAD_DEG
+            if target_is_ahead:
+                if self._calib_stall_since[i] is None:
+                    self._calib_stall_since[i] = now
+                    self._calib_stall_raw_at[i] = raw_pos
+                elif abs(raw_pos - self._calib_stall_raw_at[i]) > self.CALIBRATION_STALL_PROGRESS_DEG:
+                    self._calib_stall_since[i] = now
+                    self._calib_stall_raw_at[i] = raw_pos
+                elif (now - self._calib_stall_since[i] >=
+                      self.CALIBRATION_STALL_SECONDS):
+                    raw_min = self._raw_position_from_feedback(i)
+                    self._log(
+                        f'Rotary Zero M2-M5: {self.joint_names[i]} '
+                        f'stalled at raw {raw_min:+.3f} deg '
+                        f'(lead={target_lead:+.3f} deg)')
+                    if not self._complete_joint_zero_calibration(
+                            i, raw_min, 'target lead stall'):
+                        return
+                    continue
+            else:
+                self._calib_stall_since[i] = None
+
+            self._calib_target_raw[i] -= self.CALIBRATION_VELOCITY_DEG_S * dt
+
+        self.bridge.publish_csp_counts(
+            self._raw_position_counts_vector(self._calib_target_raw))
+
+        if (elapsed > self.CALIBRATION_NO_MOVE_ABORT_SECONDS and
+                not any_moved_negative):
+            self._finish_zero_calibration(save=False, reason='no movement')
+            return
+
+        if all(self._calib_hit[i] for i in self._calib_indices):
+            self._finish_zero_calibration(save=True, reason='complete')
+
+    def _finish_zero_calibration(self, save: bool, reason: str):
+        self._calib_timer.stop()
+        hold_raw = list(self._calib_target_raw)
+        self.bridge.publish_csp_counts(
+            self._raw_position_counts_vector(hold_raw))
+        self.bridge.publish_csv([0.0] * self.num)
+        self._csv_targets = [0.0] * self.num
+        self._calibrating_zero = False
+        self._set_calibration_buttons_active(False)
+
+        if not save:
+            saved = [
+                self.joint_names[i]
+                for i in self._calib_indices if self._calib_hit[i]
+            ]
+            self._log(
+                f'Rotary Zero M2-M5: {reason}; stopped. '
+                f'Completed joints already saved: {saved}',
+                'warn')
             return
 
         self._log(
-            f'Enable All (staggered): {len(targets)} joint(s), '
-            f'{batch_sz} per batch, {delay_ms} ms apart -> '
-            f'{[self.joint_names[i] for i in targets]}')
+            f'Rotary Zero M2-M5: complete; saved offsets to {self._limits_path}.')
 
-        def kick_batch(start: int):
-            batch = targets[start:start + batch_sz]
-            for idx in batch:
+    # ---- Full travel range calibration ----------------------
+    def _start_range_calibration(self):
+        """
+        Move negative to find the minimum physical limit, then move positive
+        to find the maximum physical limit. The measured difference becomes
+        range_deg. The calibrated zero is left unchanged; the software max is
+        updated to match the measured range, while the default pose is kept as
+        an explicit user calibration.
+        """
+        if (self._calibrating_zero or self._calibrating_range or
+                self._calibrating_linear_axis):
+            return
+        if self._limits_path is None:
+            self._log(
+                'Rotary Range M2-M5: no calibrate.json path found.', 'error')
+            return
+
+        target_indices = self._rotary_motor_indices()
+        if self._enabled_calibration_not_ready(
+                'Rotary Range M2-M5', target_indices):
+            return
+
+        now = time.monotonic()
+        self._calibrating_range = True
+        self._calib_indices = target_indices
+        self._calib_start_time = now
+        self._calib_last_tick = now
+        self._calib_stall_since = [None] * self.num
+        self._calib_stall_raw_at = [0.0] * self.num
+        self._calib_hit = [i not in target_indices for i in range(self.num)]
+        self._calib_raw_min = {}
+        self._calib_raw_max = {}
+        self._calib_range_phase = ['negative'] * self.num
+        self._calib_phase_start_time = [now] * self.num
+        self._calib_start_raw = [
+            self._raw_position_from_feedback(i) for i in range(self.num)]
+        self._calib_target_raw = list(self._calib_start_raw)
+
+        self._enter_raw_csp_calibration('Rotary Range M2-M5')
+        self._log(
+            'Rotary Range M2-M5: moving M2-M5 negative first, then positive '
+            'after each joint reaches its negative limit.', 'warn')
+
+        def _inject_csp_and_start():
+            if not self._calibrating_range:
+                return
+            self.bridge.publish_csp_counts(
+                self._raw_position_counts_vector(self._calib_target_raw))
+            mvec = [float(p.mode_display or MODE.NO_MODE)
+                    for p in self.panels]
+            for idx in target_indices:
+                mvec[idx] = float(MODE.CSP)
+            self.bridge.publish_mode(mvec)
+            self._set_calibration_buttons_active(True)
+            self._calib_last_tick = time.monotonic()
+            self._calib_timer.start()
+
+        QTimer.singleShot(300, _inject_csp_and_start)
+
+    def _complete_joint_range_limit(
+            self, idx: int, raw_limit: float, detail: str) -> bool:
+        joint_name = self.joint_names[idx]
+        phase = self._calib_range_phase[idx]
+        now = time.monotonic()
+
+        if phase == 'negative':
+            self._calib_raw_min[joint_name] = raw_limit
+            self._calib_range_phase[idx] = 'positive'
+            self._calib_start_raw[idx] = raw_limit
+            self._calib_target_raw[idx] = raw_limit
+            self._calib_stall_since[idx] = None
+            self._calib_stall_raw_at[idx] = raw_limit
+            self._calib_phase_start_time[idx] = now
+            self._log(
+                f'Rotary Range M2-M5: {joint_name} found negative limit at '
+                f'raw={raw_limit:+.3f} deg ({detail}); reversing positive.')
+            return True
+
+        if self._calib_hit[idx]:
+            return True
+
+        raw_min = self._calib_raw_min.get(joint_name)
+        if raw_min is None:
+            self._log(
+                f'Rotary Range M2-M5: {joint_name} has no recorded negative '
+                'limit; abort.', 'error')
+            self._finish_range_calibration(save=False, reason='missing min')
+            return False
+
+        raw_max = raw_limit
+        measured_range = raw_max - raw_min
+        if measured_range <= 0.0:
+            self._log(
+                f'Rotary Range M2-M5: {joint_name} invalid range '
+                f'min={raw_min:+.3f}, max={raw_max:+.3f}; abort.', 'error')
+            self._finish_range_calibration(save=False, reason='invalid range')
+            return False
+
+        self._calib_hit[idx] = True
+        self._calib_raw_max[joint_name] = raw_max
+        self._calib_target_raw[idx] = raw_max
+
+        try:
+            save_range_calibration(
+                self._limits_path,
+                [joint_name],
+                {joint_name: raw_min},
+                {joint_name: raw_max})
+            self.position_limits, self._limits_path = load_joint_limits()
+            limit = self.position_limits.get(joint_name)
+            self.panels[idx].update_position_limit(limit)
+            if limit is not None:
+                self.panels[idx].set_position_setpoint_deg(limit.default_deg)
+        except Exception as exc:                     # noqa: BLE001
+            self._log(
+                f'Rotary Range M2-M5: failed to save {joint_name}: {exc}',
+                'error')
+            self._finish_range_calibration(save=False, reason='save failed')
+            return False
+
+        self._log(
+            f'Rotary Range M2-M5: {joint_name} saved range='
+            f'{measured_range:.3f} deg, raw_min={raw_min:+.3f} deg, '
+            f'raw_max={raw_max:+.3f} deg ({detail}); remaining='
+            f'{[self.joint_names[i] for i in self._calib_indices if not self._calib_hit[i]]}')
+        return True
+
+    def _tick_range_calibration(self):
+        if not self._calibrating_range:
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._calib_start_time
+        if elapsed > self.CALIBRATION_RANGE_TIMEOUT_SECONDS:
+            self._finish_range_calibration(save=False, reason='timeout')
+            return
+
+        dt = max(0.0, min(now - self._calib_last_tick, 0.2))
+        self._calib_last_tick = now
+        active_count = 0
+        all_active_no_move_timed_out = True
+
+        for i, p in enumerate(self.panels):
+            if i not in self._calib_indices:
+                continue
+            if self._calib_hit[i]:
+                continue
+
+            active_count += 1
+            phase = self._calib_range_phase[i]
+            direction = -1.0 if phase == 'negative' else 1.0
+            phase_label = 'negative' if direction < 0.0 else 'positive'
+            phase_elapsed = now - self._calib_phase_start_time[i]
+            st = parse_status_word(p.status_word)
+            raw_pos = self._raw_position_from_feedback(i)
+            moved = direction * (raw_pos - self._calib_start_raw[i])
+            target_lead = direction * (self._calib_target_raw[i] - raw_pos)
+            moved_in_direction = moved >= self.CALIBRATION_MIN_MOVEMENT_DEG
+
+            if moved_in_direction or (
+                    phase_elapsed <= self.CALIBRATION_NO_MOVE_ABORT_SECONDS):
+                all_active_no_move_timed_out = False
+
+            if st.fault:
+                limit_like_fault = (
+                    phase_elapsed >= self.CALIBRATION_MIN_RUN_SECONDS and
+                    moved_in_direction and
+                    target_lead >= self.CALIBRATION_FAULT_TARGET_LEAD_DEG and
+                    abs(float(p._cached_vel_deg_s)) <=
+                    self.CALIBRATION_STALL_VEL_DEG_S)
+                if limit_like_fault and direction > 0.0:
+                    self._log(
+                        f'Rotary Range M2-M5: {self.joint_names[i]} faulted at '
+                        f'near-zero velocity; treating as positive limit. '
+                        f'sw=0x{p.status_word:04X}, raw={raw_pos:+.3f} deg, '
+                        f'moved={moved:+.3f} deg, '
+                        f'lead={target_lead:+.3f} deg, '
+                        f'vel={p._cached_vel_deg_s:+.3f} deg/s.',
+                        'warn')
+                    if not self._complete_joint_range_limit(
+                            i, raw_pos, 'fault near positive limit'):
+                        return
+                    continue
+
                 self._log(
-                    f'  staggered enable -> {self.joint_names[idx]}')
-                self._start_enable_sequence(idx)
-            nxt = start + batch_sz
-            if nxt < len(targets):
-                QTimer.singleShot(delay_ms, lambda: kick_batch(nxt))
+                    f'Rotary Range M2-M5: {self.joint_names[i]} faulted during '
+                    f'{phase_label} travel; abort. '
+                    f'sw=0x{p.status_word:04X}, raw={raw_pos:+.3f} deg, '
+                    f'moved={moved:+.3f} deg, lead={target_lead:+.3f} deg, '
+                    f'vel={p._cached_vel_deg_s:+.3f} deg/s.',
+                    'error')
+                self._finish_range_calibration(save=False, reason='fault')
+                return
 
-        kick_batch(0)
+            if (phase_elapsed >= self.CALIBRATION_MIN_RUN_SECONDS and
+                    moved_in_direction):
+                target_is_ahead = (
+                    target_lead >= self.CALIBRATION_TARGET_LEAD_DEG)
+                if target_is_ahead:
+                    if self._calib_stall_since[i] is None:
+                        self._calib_stall_since[i] = now
+                        self._calib_stall_raw_at[i] = raw_pos
+                    elif abs(raw_pos - self._calib_stall_raw_at[i]) > self.CALIBRATION_STALL_PROGRESS_DEG:
+                        self._calib_stall_since[i] = now
+                        self._calib_stall_raw_at[i] = raw_pos
+                    elif (now - self._calib_stall_since[i] >=
+                          self.CALIBRATION_STALL_SECONDS):
+                        raw_limit = self._raw_position_from_feedback(i)
+                        self._log(
+                            f'Rotary Range M2-M5: {self.joint_names[i]} '
+                            f'{phase_label} stall at raw '
+                            f'{raw_limit:+.3f} deg '
+                            f'(lead={target_lead:+.3f} deg)')
+                        if not self._complete_joint_range_limit(
+                                i, raw_limit,
+                                f'{phase_label} target lead stall'):
+                            return
+                        continue
+                else:
+                    self._calib_stall_since[i] = None
 
-    def _disable_all(self):
-        """Disable every joint at once (safe: just CW=0x0000)."""
-        self._log('Disable All')
-        for t in list(self._enable_timers.values()):
-            t.stop()
-        self._enable_timers.clear()
-        self.bridge.publish_control_word(
-            [float(CW.DISABLE_VOLTAGE)] * self.num)
+            self._calib_target_raw[i] += (
+                direction * self.CALIBRATION_VELOCITY_DEG_S * dt)
+
+        self.bridge.publish_csp_counts(
+            self._raw_position_counts_vector(self._calib_target_raw))
+
+        if active_count > 0 and all_active_no_move_timed_out:
+            self._finish_range_calibration(save=False, reason='no movement')
+            return
+
+        if all(self._calib_hit[i] for i in self._calib_indices):
+            self._finish_range_calibration(save=True, reason='complete')
+
+    def _finish_range_calibration(self, save: bool, reason: str):
+        self._calib_timer.stop()
+        hold_raw = list(self._calib_target_raw)
+        self.bridge.publish_csp_counts(
+            self._raw_position_counts_vector(hold_raw))
+        self.bridge.publish_csv([0.0] * self.num)
+        self._csv_targets = [0.0] * self.num
+        self._calibrating_range = False
+        self._set_calibration_buttons_active(False)
+
+        if not save:
+            saved = [
+                self.joint_names[i]
+                for i in self._calib_indices if self._calib_hit[i]
+            ]
+            mins = [
+                self.joint_names[i] for i in self._calib_indices
+                if (
+                    self.joint_names[i] in self._calib_raw_min and
+                    self.joint_names[i] not in saved
+                )
+            ]
+            self._log(
+                f'Rotary Range M2-M5: {reason}; stopped. '
+                f'Completed joints already saved: {saved}; '
+                f'joints with only negative limit recorded: {mins}',
+                'warn')
+            return
+
+        self._log(
+            f'Rotary Range M2-M5: complete; saved ranges to {self._limits_path}.')
 
     def _on_reset_fault(self, idx: int):
         """
@@ -972,7 +2111,32 @@ class MultiMotorWidget(QWidget):
         if target_mode == MODE.PROFILE_POSITION:
             cur = self.panels[idx].align_setpoint_to_feedback()
             self._log(f'{self.joint_names[idx]}: PP setpoint '
-                      f'aligned to feedback {cur:+.3f} deg')
+                      f'aligned to feedback '
+                      f'{self._format_panel_value(idx, cur)}')
+            self._switch_motion_controller(target_ctrl)
+            self._log(f'{self.joint_names[idx]}: activated {target_ctrl}')
+
+            def _publish_and_inject_pp():
+                pos_vec = self._feedback_position_vector()
+                self.bridge.publish_pp(pos_vec)
+                self._log(
+                    f'{self.joint_names[idx]}: published PP position, '
+                    f'waiting for CI to stabilize...')
+
+                def _inject_pp():
+                    fresh = self._feedback_position_vector()
+                    self.bridge.publish_pp(fresh)
+                    mvec = [float(p.mode_display or MODE.NO_MODE)
+                            for p in self.panels]
+                    mvec[idx] = float(target_mode)
+                    self.bridge.publish_mode(mvec)
+                    self._log(
+                        f'{self.joint_names[idx]}: PP mode injected safely')
+
+                QTimer.singleShot(200, _inject_pp)
+
+            QTimer.singleShot(50, _publish_and_inject_pp)
+            return
 
         if target_mode == MODE.CSP:
             # CSP 安全切换时序：
@@ -982,28 +2146,21 @@ class MultiMotorWidget(QWidget):
             # 4. 最后再注入 CSP 模式
             cur = self.panels[idx].align_setpoint_to_feedback()
             self._log(f'{self.joint_names[idx]}: CSP setpoint '
-                      f'aligned to feedback {cur:+.3f} deg')
+                      f'aligned to feedback '
+                      f'{self._format_panel_value(idx, cur)}')
 
-            to_deact = [c for c in self.ALL_MOTION_CTRLS
-                        if c != target_ctrl and c == self._active_ctrl]
-            self.bridge.switch_controller(
-                activate=[target_ctrl],
-                deactivate=to_deact,
-                strictness=SwitchController.Request.BEST_EFFORT,
-            )
-            self._active_ctrl = target_ctrl
+            self._switch_motion_controller(target_ctrl)
             self._log(f'{self.joint_names[idx]}: activated {target_ctrl}')
 
             def _publish_and_inject():
-                pos_vec = [float(p._cached_pos_deg) for p in self.panels]
+                pos_vec = self._feedback_position_vector()
                 self.bridge.publish_csp(pos_vec)
                 self._log(
                     f'{self.joint_names[idx]}: published CSP position, '
                     f'waiting for CI to stabilize...')
 
                 def _inject():
-                    fresh = [float(p._cached_pos_deg)
-                             for p in self.panels]
+                    fresh = self._feedback_position_vector()
                     self.bridge.publish_csp(fresh)
                     mvec = [float(p.mode_display or MODE.NO_MODE)
                             for p in self.panels]
@@ -1024,14 +2181,7 @@ class MultiMotorWidget(QWidget):
             self.bridge.publish_mode(mvec)
 
             def do_switch():
-                to_deact = [c for c in self.ALL_MOTION_CTRLS
-                            if c != target_ctrl and c == self._active_ctrl]
-                self.bridge.switch_controller(
-                    activate=[target_ctrl],
-                    deactivate=to_deact,
-                    strictness=SwitchController.Request.BEST_EFFORT,
-                )
-                self._active_ctrl = target_ctrl
+                self._switch_motion_controller(target_ctrl)
 
             QTimer.singleShot(200, do_switch)
 
@@ -1043,7 +2193,7 @@ class MultiMotorWidget(QWidget):
             return
 
         target = self.panels[idx].position_setpoint_deg()
-        vec = [float(p._cached_pos_deg) for p in self.panels]
+        vec = self._feedback_position_vector()
         vec[idx] = float(target)
         self.bridge.publish_pp(vec)
 
@@ -1053,7 +2203,9 @@ class MultiMotorWidget(QWidget):
         cw_start[idx] = float(
             CW.ENABLE_OPERATION | CW.NEW_SET_POINT | CW.CHANGE_IMMEDIATE)
         self.bridge.publish_control_word(cw_start)
-        self._log(f'{self.joint_names[idx]}: PP target {target:+.3f} deg')
+        self._log(
+            f'{self.joint_names[idx]}: PP target '
+            f'{self._format_panel_value(idx, target)}')
 
         def _clear_new_set_point():
             cw_hold = self._current_cw_vector()
@@ -1075,7 +2227,8 @@ class MultiMotorWidget(QWidget):
         # 提前 setValue 即可保证首帧 setpoint == 当前 feedback。
         cur = self.panels[idx].align_setpoint_to_feedback()
         self._log(f'{self.joint_names[idx]}: CSP stream start, '
-                  f'first setpoint aligned to {cur:+.3f} deg')
+                  f'first setpoint aligned to '
+                  f'{self._format_panel_value(idx, cur)}')
 
         self._streaming_csp[idx] = True
         self.panels[idx].btn_stream_start.setEnabled(False)
@@ -1099,7 +2252,7 @@ class MultiMotorWidget(QWidget):
 
         目标位置以 deg 写入 unit_converter，再由其转换到底层 counts。
         """
-        vec = [float(p._cached_pos_deg) for p in self.panels]
+        vec = self._feedback_position_vector()
         for i, streaming in enumerate(self._streaming_csp):
             if streaming:
                 vec[i] = float(self.panels[i].position_setpoint_deg())
@@ -1111,11 +2264,15 @@ class MultiMotorWidget(QWidget):
         if self._active_ctrl == 'csv_controller':
             self._csv_targets[idx] = float(v)
             self.bridge.publish_csv(self._csv_targets)
-            self._log(f'{self.joint_names[idx]}: CSV {v:+.3f} deg/s')
+            self._log(
+                f'{self.joint_names[idx]}: CSV '
+                f'{v:+.3f} {self._panel_unit(idx)}/s')
         elif self._active_ctrl == 'pv_controller':
             self._pv_targets[idx] = float(v)
             self.bridge.publish_pv(self._pv_targets)
-            self._log(f'{self.joint_names[idx]}: PV {v:+.3f} deg/s')
+            self._log(
+                f'{self.joint_names[idx]}: PV '
+                f'{v:+.3f} {self._panel_unit(idx)}/s')
         else:
             self._log('Select CSV or PV mode and press Apply first.', 'warn')
 
@@ -1149,6 +2306,8 @@ class MultiMotorWidget(QWidget):
     # ------------------------------------------------------
     def shutdown(self):
         self._csp_timer.stop()
+        self._calib_timer.stop()
+        self._cancel_enable_all_timers()
         for t in self._enable_timers.values():
             t.stop()
         # Ensure drives go back to disabled on exit.
@@ -1191,7 +2350,7 @@ class MotorRQTPlugin(Plugin):
         # Priority (highest first):
         #   1. JOINT_NAMES env var  (comma-separated, e.g. "joint_1,joint_3,joint_4")
         #   2. /dynamic_joint_states  (first message, wait up to 3 s)
-        #   3. Hard-coded default: joint_1 .. joint_4
+        #   3. Hard-coded default: joint_1 .. joint_5
         #
         # This ensures the plugin publishes the correct array length when the bus
         # only has a subset of joints (e.g. joint_1+joint_3+joint_4).

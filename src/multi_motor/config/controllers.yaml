@@ -2,7 +2,7 @@
 # controllers.yaml
 # ------------------------------------------------------------
 #   Controller manager configuration for the Denali XCR
-#   multi-motor system (4 .. 8 joints by default).
+#   multi-motor system (5 joints by default; still parametric in URDF).
 #
 #   Layout:
 #     always-active controllers (loaded+started by launch):
@@ -18,8 +18,8 @@
 #       - csv_controller
 #       - pv_controller
 #
-#   Expansion to 8 joints: just append joint_5 .. joint_8 to
-#   every `joints:` list below.
+#   Expansion beyond 5 joints: append joint_6 .. joint_N to every
+#   `joints:` list below.
 # ============================================================
 
 controller_manager:
@@ -80,6 +80,7 @@ cia402_cmd_controller:
       - joint_2
       - joint_3
       - joint_4
+      - joint_5
     interface_name: control_word
 
 # Modes of Operation writer (object 0x6060). Values:
@@ -92,6 +93,7 @@ cia402_mode_controller:
       - joint_2
       - joint_3
       - joint_4
+      - joint_5
     interface_name: modes_of_operation
 
 # Fault-reset auxiliary pulser. With auto_state_transitions=false,
@@ -105,6 +107,7 @@ fault_reset_controller:
       - joint_2
       - joint_3
       - joint_4
+      - joint_5
     interface_name: reset_fault
 
 # --- motion controllers -------------------------------------------------
@@ -119,6 +122,7 @@ pp_controller:
       - joint_2
       - joint_3
       - joint_4
+      - joint_5
     interface_name: position
 
 # CSP - Cyclic Sync Position. Topic: /csp_controller/commands
@@ -129,6 +133,7 @@ csp_controller:
       - joint_2
       - joint_3
       - joint_4
+      - joint_5
 
 # CSV - Cyclic Sync Velocity. Topic: /csv_controller/commands
 csv_controller:
@@ -138,6 +143,7 @@ csv_controller:
       - joint_2
       - joint_3
       - joint_4
+      - joint_5
 
 # PV - Profile Velocity.  CiA 402 uses 0x60FF Target Velocity in
 # Profile Velocity mode too. This intentionally shares the same
@@ -151,4 +157,5 @@ pv_controller:
       - joint_2
       - joint_3
       - joint_4
+      - joint_5
     interface_name: velocity

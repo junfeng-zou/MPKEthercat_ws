@@ -26,6 +26,8 @@ compile_commands.json
 
 # Local ROS/runtime files
 /.ros/
+/state/
+/src/multi_motor/calibrate\ copy.json
 *.bag
 *.db3
 *.mcap

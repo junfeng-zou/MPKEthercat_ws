@@ -1,0 +1,42 @@
+{
+  "joint_1": {
+    "min_mm": 0.0,
+    "max_mm": 264.83673095703125,
+    "range_mm": 264.83673095703125,
+    "default_mm": 0.0,
+    "zero_position_cnt": -4939277.0,
+    "min_deg": 0.0,
+    "max_deg": 264.83673095703125,
+    "range_deg": 264.83673095703125,
+    "default_deg": 0.0,
+    "home_offset_deg": 0.0
+  },
+  "joint_2": {
+    "min_deg": 0.0,
+    "max_deg": 353.2291759144176,
+    "range_deg": 353.2291759144176,
+    "default_deg": 266.34729558771306,
+    "home_offset_deg": 230.54976029829547
+  },
+  "joint_3": {
+    "min_deg": 0.0,
+    "max_deg": 353.23999578302556,
+    "range_deg": 353.23999578302556,
+    "default_deg": 60.661593350497164,
+    "home_offset_deg": 50.6744384765625
+  },
+  "joint_4": {
+    "min_deg": 0.0,
+    "max_deg": 352.62118252840907,
+    "range_deg": 352.62118252840907,
+    "default_deg": 139.9350253018466,
+    "home_offset_deg": 131.91292502663353
+  },
+  "joint_5": {
+    "min_deg": 0.0,
+    "max_deg": 353.56584028764206,
+    "range_deg": 353.56584028764206,
+    "default_deg": 23.9044189453125,
+    "home_offset_deg": 142.50640869140625
+  }
+}

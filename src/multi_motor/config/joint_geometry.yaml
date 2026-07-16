@@ -1,0 +1,32 @@
+joints:
+  joint_1:
+    axis_type: linear
+    unit: mm
+    encoder_one_turn_cnt: 131072
+    encoder_counts_per_rev: 131072.0
+    screw_lead_mm_per_rev: 10.0
+    linear_direction: 1.0
+
+  joint_2:
+    axis_type: rotary
+    unit: deg
+    encoder_one_turn_cnt: 131072
+    encoder_resolution: 865075.2
+
+  joint_3:
+    axis_type: rotary
+    unit: deg
+    encoder_one_turn_cnt: 131072
+    encoder_resolution: 865075.2
+
+  joint_4:
+    axis_type: rotary
+    unit: deg
+    encoder_one_turn_cnt: 131072
+    encoder_resolution: 865075.2
+
+  joint_5:
+    axis_type: rotary
+    unit: deg
+    encoder_one_turn_cnt: 131072
+    encoder_resolution: 865075.2
