@@ -1,143 +1,173 @@
 # MPKEthercat_ws
 
-EtherCAT motor-control codebase for MPK/Denali XCR CiA 402 drives.
+ROS 2 EtherCAT workspace for controlling five Novanta Denali XCR servo drives with the IgH EtherCAT Master and `ros2_control`.
 
-Maintained by **zjf**.
+The default machine layout is:
 
-The maintained implementation uses the IgH EtherCAT master, `ros2_control`,
-and an rqt GUI under ROS 2.
+- `joint_1`: ball-screw linear axis, controlled in mm and mm/s.
+- `joint_2` to `joint_5`: rotary axes, controlled in degrees and degrees/s.
+
+The project provides a custom rqt control panel, CiA 402 state control, runtime mode switching, joint calibration, software position limits, and continuous encoder-position recovery across drive restarts.
+
+> **Safety:** This software controls real motors. Test with low speed and torque limits, keep an emergency stop available, and verify the mechanical workspace before enabling any drive. Software calibration and limits do not replace hardware safety devices.
+
+## Features
+
+- Five-axis Denali XCR control over EtherCAT.
+- PP, CSP, CSV, and PV CiA 402 operating modes.
+- Explicit drive enable, disable, and fault reset.
+- Mutually exclusive `ros2_control` motion controllers.
+- rqt and standalone Qt control interfaces.
+- Batch enable/disable and move-to-default commands.
+- Linear-axis and rotary-axis calibration tools.
+- Per-joint unit conversion and software position limits.
+- Persistent multi-turn encoder-position recovery.
+- Vendored `ethercat_driver_ros2` with project-specific changes.
 
 ## Repository Layout
 
 ```text
-.
-├── src/
-│   ├── ethercat_driver_ros2/    # EtherCAT ROS 2 driver stack, vendored as source
-│   └── multi_motor/             # Main ROS 2 multi-motor control package
-├── docs/                        # Project notes and integration docs
-├── legacy/                      # Archived early test code, not tracked/uploaded
-└── build/ install/ log/         # Local colcon outputs, ignored by Git
+MPKEthercat_ws/
+├── README.md
+├── .gitignore
+└── src/
+    ├── ethercat_driver_ros2/       # Customized ROS 2 EtherCAT driver
+    └── multi_motor/                # Main five-axis control package
+        ├── config/                 # EtherCAT, controller, and joint settings
+        ├── launch/                 # Main and PV diagnostic launch files
+        ├── multi_motor_control/    # GUI, CiA 402, limits, and conversion code
+        ├── urdf/                   # ros2_control xacro files
+        ├── calibrate.json          # Machine-specific calibration values
+        ├── package.xml
+        └── setup.py
 ```
 
-## ROS 2 + IgH + ros2_control
+Generated directories such as `build/`, `install/`, `log/`, and `state/` are not tracked by Git.
 
-Main package:
+## Requirements
 
-```text
-src/multi_motor
-```
+- Ubuntu 22.04
+- ROS 2 Humble
+- IgH EtherCAT Master / EtherLab 1.5.x
+- `ros2_control` and `ros2_controllers`
+- Novanta Denali XCR EtherCAT drives
+- Python 3, PyYAML, and rqt
 
-This package is installed as `multi_motor_control`. It controls five Denali XCR
-drives by default: one ball-screw linear axis and four rotary axes. It supports:
+The IgH master must be installed, configured for the EtherCAT network adapter, and running before the ROS 2 system is launched. See [the bundled driver installation guide](src/ethercat_driver_ros2/INSTALL.md) for the IgH and driver setup.
 
-| Mode | CiA 402 value | Target object |
-|------|---------------|---------------|
-| PP   | 1             | `0x607A` Target Position |
-| PV   | 3             | `0x60FF` Target Velocity |
-| CSP  | 8             | `0x607A` Target Position |
-| CSV  | 9             | `0x60FF` Target Velocity |
-
-The GUI uses `/dynamic_joint_states` for drive status and the ROS-level API
-under `/multi_motor/*` for motion commands and feedback. The launch file starts
-`unit_converter`, which converts the linear axis to mm and the rotary axes to
-degrees before forwarding commands to the low-level ros2_control topics.
-
-### ROS 2 Build
-
-From the repository root:
+Verify the EtherCAT bus before continuing:
 
 ```bash
-colcon build --symlink-install
+sudo /etc/init.d/ethercat start
+ethercat slaves
+```
+
+The default configuration expects five drives in bus order, with `joint_1` mapped to slave position 0 and `joint_5` mapped to slave position 4.
+
+## Install ROS Dependencies
+
+```bash
+source /opt/ros/humble/setup.bash
+
+sudo apt update
+sudo apt install -y \
+  python3-colcon-common-extensions \
+  python3-rosdep \
+  python3-yaml \
+  ros-humble-ros2-control \
+  ros-humble-ros2-controllers \
+  ros-humble-controller-manager \
+  ros-humble-control-msgs \
+  ros-humble-rqt-gui \
+  ros-humble-rqt-gui-py \
+  ros-humble-xacro \
+  ros-humble-robot-state-publisher
+```
+
+From the workspace root, install any remaining package dependencies:
+
+```bash
+# Run these two commands once if rosdep is not initialized yet:
+sudo rosdep init
+rosdep update
+
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+## Build
+
+```bash
+cd ~/MPK_SDK/MPKEthercat_ws
+source /opt/ros/humble/setup.bash
+
+colcon build --symlink-install \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+
 source install/setup.bash
 ```
 
-To build only the main application and driver stack:
+To rebuild only the application package:
 
 ```bash
-colcon build --symlink-install --packages-select \
-  ethercat_interface ethercat_driver ethercat_generic_slave \
-  ethercat_generic_cia402_drive ethercat_msgs ethercat_manager \
-  ethercat_driver_ros2 multi_motor_control
+colcon build --symlink-install --packages-select multi_motor_control
 source install/setup.bash
 ```
 
-### ROS 2 Run
+## Run
 
-Bring up the hardware and controllers:
+Start the EtherCAT hardware interface, controllers, state converter, and robot state publisher:
 
 ```bash
+source /opt/ros/humble/setup.bash
+source ~/MPK_SDK/MPKEthercat_ws/install/setup.bash
 ros2 launch multi_motor_control multi_motor_control.launch.py
 ```
 
-Open the GUI in another terminal:
+All motion controllers are loaded inactive, and the drives are not enabled automatically.
+
+In another terminal, start the standalone control panel:
 
 ```bash
-source install/setup.bash
+source /opt/ros/humble/setup.bash
+source ~/MPK_SDK/MPKEthercat_ws/install/setup.bash
 ros2 run multi_motor_control my_motor_rqt_plugin
 ```
 
-or through rqt:
+The same panel can be opened through rqt:
 
 ```bash
 rqt --force-discover
 ```
 
-then select `Plugins -> Robot -> Multi Motor Control`.
+Select `Plugins -> Robot -> Multi Motor Control`.
 
-More details are in:
+For a reduced Profile Velocity diagnostic setup:
 
-```text
-src/multi_motor/README.md
+```bash
+ros2 launch multi_motor_control multi_motor_pv_test.launch.py
 ```
 
-## Important Directories
+## Control Modes
 
-`src/ethercat_driver_ros2`
+| Mode | CiA 402 value | Controller | Target object |
+|---|---:|---|---|
+| PP | 1 | `pp_controller` | `0x607A` Target Position |
+| CSP | 8 | `csp_controller` | `0x607A` Target Position |
+| CSV | 9 | `csv_controller` | `0x60FF` Target Velocity |
+| PV | 3 | `pv_controller` | `0x60FF` Target Velocity |
 
-: Vendored ROS 2 EtherCAT driver stack. This repository keeps it as normal
-  source code rather than a Git submodule, because the local project contains
-  drive-specific changes such as Profile Position command handling.
+Higher-level applications should publish physical-unit commands through the `/multi_motor/*` topics. These commands pass through unit conversion, encoder restoration, and position-limit checks before reaching the low-level controllers.
 
-`src/multi_motor`
+## Main Configuration Files
 
-: Main maintained ROS 2 application. It contains the launch files, xacro URDF,
-  EtherCAT slave YAML, controller YAML, and rqt/standalone GUI.
+- `src/multi_motor/config/ethercat_system.yaml`: Denali XCR PDO, SDO, and Sync Manager configuration.
+- `src/multi_motor/config/controllers.yaml`: controller definitions and joint lists.
+- `src/multi_motor/config/joint_geometry.yaml`: axis types and encoder/mechanical conversion parameters.
+- `src/multi_motor/calibrate.json`: machine-specific limits, zero offsets, and default positions.
+- `src/multi_motor/launch/multi_motor_control.launch.py`: system startup and encoder-recovery parameters.
 
-`legacy`
+Back up `calibrate.json` before recalibrating the machine. If the number of joints changes, update the controller joint lists, geometry, and calibration files together.
 
-: Old early-stage test package. It is kept locally for reference, but ignored
-  for Git upload and colcon builds.
+## License
 
-## Git / Upload Policy
-
-Tracked source should include:
-
-- `README.md` and source/config files
-- `src/multi_motor/`
-- `src/ethercat_driver_ros2/`
-- project config files such as `.gitignore`
-
-Ignored local/generated data:
-
-- `build/`
-- `install/`
-- `log/`
-- `docs/`
-- `legacy/`
-- `src/MPK_SOEM/`
-- editor and assistant state: `.vscode/`, `.codex/`, `.agents/`
-- Python caches and compiled artifacts
-
-The root `.gitignore` is configured for this layout.
-
-## Troubleshooting Notes
-
-- If the GUI shows `status_word = 0x0000` for every motor, first check whether
-  EtherCAT slaves reached OP state. This usually points below the GUI layer.
-- `/dynamic_joint_states` must contain `status_word` and
-  `modes_of_operation_display` for the ROS 2 GUI to show drive status.
-- `assign_activate: 0x0300` enables DC SYNC0 and is useful for CSP/CSV. For
-  PP/PV-only diagnosis, temporarily testing `assign_activate: 0x0000` can help
-  separate DC timing issues from wiring/power issues.
-- Do not upload `build/`, `install/`, `log/`, or `docs/`; regenerate runtime
-  outputs locally and keep private notes outside Git.
+`multi_motor_control` declares the Apache-2.0 license in its package manifest. The bundled EtherCAT driver retains its upstream license in [src/ethercat_driver_ros2/LICENSE](src/ethercat_driver_ros2/LICENSE).
