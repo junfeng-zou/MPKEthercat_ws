@@ -9,6 +9,8 @@ The default machine layout is:
 
 The project provides a custom rqt control panel, CiA 402 state control, runtime mode switching, joint calibration, software position limits, and continuous encoder-position recovery across drive restarts.
 
+For integration with a higher-level system controller, see the [Chinese control API reference](CONTROL_API_CN.md).
+
 > **Safety:** This software controls real motors. Test with low speed and torque limits, keep an emergency stop available, and verify the mechanical workspace before enabling any drive. Software calibration and limits do not replace hardware safety devices.
 
 ## Features
